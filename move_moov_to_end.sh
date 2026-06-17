@@ -39,12 +39,11 @@ process_file() {
 
   echo "Processing: $input → $output"
 
-  # -movflags +omit_tfhd_offset writes moov AFTER mdat (end of file).
+  # Default ffmpeg behavior writes moov after mdat (end of file).
   # We explicitly avoid +faststart (which would move moov to the front).
   ffmpeg -y \
     -i "$input" \
     -c copy \
-    -movflags +omit_tfhd_offset \
     "$output" \
     2>&1 | grep -E "^(ffmpeg|Input|Output|Stream|frame|size|video|audio|Error)" || true
 

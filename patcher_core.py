@@ -279,26 +279,29 @@ def _find_box(data, box_type, start=0, end=None):
 
 
 def move_moov_to_end(input_path, output_path, log_func=None):
-    script = _SCRIPT_DIR / "move_moov_to_end.sh"
-    cmd = [
-        "bash", str(script),
-        str(input_path),
-        str(output_path),
-    ]
-    if log_func:
-        log_func(f"[MOVE_MOOV] $ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line and log_func:
-            log_func(f"[move_moov] {line}")
-    proc.wait()
-    if proc.returncode != 0:
+    data = input_path.read_bytes()
+    idx = data.find(b'moov')
+    if idx < 4:
         if log_func:
-            log_func(f"[ERROR] move_moov_to_end.sh exited {proc.returncode}")
+            log_func("[ERROR] moov atom not found")
         return False
+    moov_start = idx - 4
+    moov_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
+    end = moov_start + moov_size
+    before = data[:moov_start]
+    after = data[end:]
+    relocated = before + after + data[moov_start:end]
+
     if log_func:
-        log_func("[MOVE_MOOV] done")
+        log_func(f"[MOVE_MOOV] moov at {moov_start}, size {moov_size} → relocated to end ({len(relocated)} bytes)")
+        # verify moov is now at the end
+        last_moov = relocated.rfind(b'moov')
+        if last_moov > len(relocated) // 2:
+            log_func("[MOVE_MOOV] moov verified at end of file")
+        else:
+            log_func("[WARNING] moov position suspicious")
+
+    output_path.write_bytes(relocated)
     return True
 
 
