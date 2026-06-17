@@ -60,7 +60,7 @@ def find_atom(atoms, path):
     return None
 
 
-def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True):
+def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True, faststart_layout=True):
     moov_pos = data.find(b'moov')
     if moov_pos < 4:
         return None
@@ -125,6 +125,7 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     new_moov_size = moov_size + growth
     result[moov_size_pos:moov_size_pos+4] = new_moov_size.to_bytes(4, 'big')
 
+    mdat_shift = growth if faststart_layout else 0
     video_stsz_start = stsz['start']
     for trak in tree:
         if trak['name'] == b'trak':
@@ -139,7 +140,7 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
                     for i in range(entry_count):
                         idx = 8 + i * 4
                         val = int.from_bytes(co_data[idx:idx+4], 'big')
-                        co_data[idx:idx+4] = (val + growth + pre_shift).to_bytes(4, 'big')
+                        co_data[idx:idx+4] = (val + mdat_shift + pre_shift).to_bytes(4, 'big')
                     result[child['start'] + pos_shift + 8:
                            child['start'] + pos_shift + 8 + len(child['data'])] = bytes(co_data)
                 elif child['name'] == b'co64':
@@ -149,7 +150,7 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
                     for i in range(entry_count):
                         idx = 8 + i * 8
                         val = int.from_bytes(co_data[idx:idx+8], 'big')
-                        co_data[idx:idx+8] = (val + growth + pre_shift).to_bytes(8, 'big')
+                        co_data[idx:idx+8] = (val + mdat_shift + pre_shift).to_bytes(8, 'big')
                     result[child['start'] + pos_shift + 8:
                            child['start'] + pos_shift + 8 + len(child['data'])] = bytes(co_data)
 
@@ -282,7 +283,6 @@ def remux(input_path, output_path, comment, log_func=None):
         "-c", "copy",
         "-brand", "isom",
         "-video_track_timescale", "90000",
-        "-movflags", "+faststart",
         "-bitexact",
         "-map_metadata", "-1",
         "-metadata", "encoder=Lavf60.16.100",
@@ -354,8 +354,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    pre_shift = 8 + md_growth
-    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True)
+    pre_shift = 8
+    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True, faststart_layout=False)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed (moov/trak/stsz not found)")
