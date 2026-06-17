@@ -448,7 +448,7 @@ def _find_audio_mdhd_via_tree(data, moov_off, moov_sz):
     for trak_off, trak_sz, tt in _iter_boxes(data, moov_off + 8, moov_off + moov_sz):
         if tt != b"trak":
             continue
-        mdia_off, _ = _find_box(data, b"mdia", trak_off + 8, trak_off + trak_sz)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off + 8, trak_off + trak_sz)
         if mdia_off == -1:
             continue
         hdlr_off, _ = _find_box(data, b"hdlr", mdia_off + 8, mdia_off + mdia_sz)
