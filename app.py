@@ -13,7 +13,7 @@ Implements 10 structural patches:
   8. Timescale fix      — mdhd timescale → 120 (120 fps)
   9. B-frame limiter    — ctts: cap non-zero offset entries at 2
  10. Bitrate spoof      — inject btrt box in stsd→avc1 with 18 Mbps
- 11. stsz count         — skipped (modifying breaks stco/stsc frame mapping)
+ 11. stsz count         — inflate to 19690 (repeat pattern, adjust stco)
 """
 
 import os, uuid, subprocess, threading, queue, struct, shutil
@@ -56,6 +56,38 @@ def find_box(data: bytes, box_type: bytes, start: int = 0, end: int | None = Non
     for off, sz, bt in iter_boxes(data, start, end):
         if bt == box_type: return off, sz
     return -1, 0
+
+
+def _adjust_chunk_offsets(data: bytes, delta: int) -> bytes:
+    """Add delta to every chunk offset in stco/co64 boxes after moov expansion."""
+    if delta == 0:
+        return data
+    p = bytearray(data)
+    i = 0
+    while i + 8 <= len(p):
+        size = struct.unpack(">I", p[i:i+4])[0]
+        btype = p[i+4:i+8]
+        if size == 0:
+            size = len(p) - i
+        if size < 8:
+            break
+        if btype in (b"stco", b"co64"):
+            entry_count = struct.unpack(">I", p[i+12:i+16])[0]
+            if entry_count > 200000:
+                break
+            entry_size = 4 if btype == b"stco" else 8
+            for j in range(entry_count):
+                off = i + 16 + j * entry_size
+                if off + entry_size > len(p):
+                    break
+                if entry_size == 4:
+                    val = struct.unpack(">I", p[off:off+4])[0]
+                    struct.pack_into(">I", p, off, val + delta)
+                else:
+                    val = struct.unpack(">Q", p[off:off+8])[0]
+                    struct.pack_into(">Q", p, off, val + delta)
+        i += size
+    return bytes(p)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch 1 — ftyp brand spoof
@@ -267,6 +299,7 @@ def patch_mdhd_timescale(data: bytes, log: queue.Queue) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
+    TARGET = 19690
     moov_off, moov_sz = find_box(data, b"moov")
     if moov_off == -1: return data
     for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
@@ -280,9 +313,34 @@ def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
         if stbl_off == -1: continue
         stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
         if stsz_off == -1: continue
-        old_count = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
-        _log(log, f"[SKIP]  stsz count {old_count} — not patched (breaks frame mapping)")
-        return data
+
+        sample_size = struct.unpack(">I", data[stsz_off+12:stsz_off+16])[0]
+        old_count   = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+
+        if sample_size != 0:
+            p = bytearray(data)
+            struct.pack_into(">I", p, stsz_off+16, TARGET)
+            _log(log, f"[PATCH] stsz  count {old_count} → {TARGET} (constant size)")
+            return bytes(p)
+
+        # Read existing entries (variable sizes)
+        entries = [struct.unpack(">I", data[stsz_off+20+i*4:stsz_off+24+i*4])[0] for i in range(old_count)]
+        # Repeat pattern to fill TARGET
+        new_entries = bytearray()
+        for i in range(TARGET):
+            new_entries.extend(struct.pack(">I", entries[i % old_count]))
+        new_body = (b"\x00\x00\x00\x00" + struct.pack(">I", 0) + struct.pack(">I", TARGET) + bytes(new_entries))
+        new_stsz = struct.pack(">I", 8+len(new_body)) + b"stsz" + new_body
+        delta = len(new_stsz) - stsz_sz
+
+        p = bytearray(data)
+        p[stsz_off:stsz_off+stsz_sz] = new_stsz
+        for poff in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+            old = struct.unpack(">I", p[poff:poff+4])[0]
+            struct.pack_into(">I", p, poff, old + delta)
+        result = _adjust_chunk_offsets(bytes(p), delta)
+        _log(log, f"[PATCH] stsz  count {old_count} → {TARGET}")
+        return result
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,16 +431,14 @@ def patch_bitrate(data: bytes, log: queue.Queue) -> bytes:
             delta = len(btrt_box)
 
             p = bytearray(data)
-            # Expand the sample entry
             struct.pack_into(">I", p, pos, entry_sz + delta)
-            # Insert btrt
             p[insert_off:insert_off] = btrt_box
-            # Update parent container sizes
             for poff in (stsd_off, stbl_off, minf_off, mdia_off, trak_off, moov_off):
                 old = struct.unpack(">I", p[poff:poff+4])[0]
                 struct.pack_into(">I", p, poff, old + delta)
+            result = _adjust_chunk_offsets(bytes(p), delta)
             _log(log, f"[PATCH] btrt  created → {TARGET:,} bps")
-            return bytes(p)
+            return result
 
     _log(log, "[WARN]  btrt  no video sample entry found — skipping")
     return data
@@ -454,7 +510,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, ""); _log(log, "── 7/11 mdhd timescale → 120 (120 fps) ─────────────────────")
         raw = patch_mdhd_timescale(raw, log)
 
-        _log(log, ""); _log(log, "── 8/11 stsz sample count (skipped — breaks frame mapping) ──")
+        _log(log, ""); _log(log, "── 8/11 stsz sample count → 19690 ────────────────────────────")
         raw = patch_stsz_count(raw, log)
 
         _log(log, ""); _log(log, "── 9/11 ctts B-frame limiter → 2 ────────────────────────────")
