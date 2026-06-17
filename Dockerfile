@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p uploads outputs && chmod +x move_moov_to_end.sh
+RUN mkdir -p uploads outputs && chmod +x move_moov_to_end.sh move_moov_to_end.py
 
 EXPOSE 5000
 
