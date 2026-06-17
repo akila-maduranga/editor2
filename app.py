@@ -6,7 +6,7 @@ Implements 10 structural patches:
   1. Brand spoofing     — ftyp: major=isom, minor=0x200, compat=[isom,iso2,avc1,mp41]
   2. Date zeroing       — mvhd/tkhd/mdhd creation_time + modification_time → 0
   3. Language spoofing  — mdhd language field → 'und' (0x55C4)
-  4. Frame count inflate— stts: collapse to 1 entry, set count=19690, delta=1
+  4. stts rewrite        — collapse to 1 entry, count from stsz, delta=1
   5. Fake trailer atom  — append invalid-size box after mdat
   6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 during remux
   7. Comment injection  — ffmpeg -metadata comment injected during remux
@@ -199,7 +199,8 @@ def patch_language(data: bytes, log: queue.Queue) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch 4 — frame count inflation via stts rewrite
 # moov → trak(video) → mdia → minf → stbl → stts
-# Collapse to 1 entry: count=19690, delta=1 (120fps with mdhd timescale=120)
+# Collapse to 1 entry: count from stsz, delta=1 (120fps with mdhd timescale=120)
+# Keeps stts/stsz consistent so players don't get stuck.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_video_trak(data: bytes, trak_off: int, trak_sz: int) -> bool:
@@ -229,22 +230,18 @@ def patch_frame_count(data: bytes, log: queue.Queue) -> bytes:
         stts_off, stts_sz = find_box(data, b"stts", stbl_off+8, stbl_off+stbl_sz)
         if stts_off == -1: continue
 
-        # Read current stts
+        # Read real frame count from stsz (keeps stts/stsz consistent)
+        stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
+        if stsz_off == -1: continue
         body_off  = stts_off + 8
-        entry_count = struct.unpack(">I", data[body_off+4:body_off+8])[0]
-        real_frames = sum(
-            struct.unpack(">I", data[body_off+8+i*8:body_off+8+i*8+4])[0]
-            for i in range(entry_count)
-        )
-
-        TARGET = 19690
-        _log(log, f"[PATCH] stts  real_frames={real_frames} → {TARGET}  delta=1")
+        real = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        _log(log, f"[PATCH] stts  frames={real}  delta=1  (120 fps)")
 
         # Build new stts: 1 entry, delta=1 (120fps with mdhd timescale=120)
         new_body = (
             b"\x00\x00\x00\x00"
             + struct.pack(">I", 1)           # entry_count = 1
-            + struct.pack(">I", TARGET)       # sample_count
+            + struct.pack(">I", real)         # sample_count from stsz
             + struct.pack(">I", 1)            # sample_delta = 1
         )
         new_stts = struct.pack(">I", 8+len(new_body)) + b"stts" + new_body
@@ -328,35 +325,7 @@ def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def patch_ctts_bframes(data: bytes, log: queue.Queue) -> bytes:
-    moov_off, moov_sz = find_box(data, b"moov")
-    if moov_off == -1: return data
-    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
-        if tt != b"trak": continue
-        if not _is_video_trak(data, trak_off, trak_sz): continue
-        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1: continue
-        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
-        if minf_off == -1: continue
-        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
-        if stbl_off == -1: continue
-        ctts_off, ctts_sz = find_box(data, b"ctts", stbl_off+8, stbl_off+stbl_sz)
-        if ctts_off == -1:
-            _log(log, "[WARN]  ctts not found — skipping B-frame patch")
-            return data
-
-        body_off = ctts_off + 8
-        entry_count = struct.unpack(">I", data[body_off+4:body_off+8])[0]
-        p = bytearray(data)
-        non_zero = 0
-        for i in range(entry_count):
-            off = body_off + 8 + i*8 + 4
-            val = struct.unpack(">i", data[off:off+4])[0]
-            if val != 0:
-                non_zero += 1
-                if non_zero > 2:
-                    struct.pack_into(">I", p, off, 0)
-        _log(log, f"[PATCH] ctts  B-frame entries → 2 (was {non_zero})")
-        return bytes(p)
+    _log(log, "[SKIP]  ctts  skipped — zeroing composition offsets corrupts display order")
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,7 +462,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, ""); _log(log, "── 8/11 stsz sample count (skipped — keeps frame mapping) ───")
         raw = patch_stsz_count(raw, log)
 
-        _log(log, ""); _log(log, "── 9/11 ctts B-frame limiter → 2 ────────────────────────────")
+        _log(log, ""); _log(log, "── 9/11 ctts B-frame limiter (skipped — corrupts display) ──")
         raw = patch_ctts_bframes(raw, log)
 
         _log(log, ""); _log(log, "── 10/11 btrt bitrate box → 18 Mbps ─────────────────────────")
