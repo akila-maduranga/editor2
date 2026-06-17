@@ -278,31 +278,58 @@ def _find_box(data, box_type, start=0, end=None):
     return -1, 0
 
 
-def move_moov_to_end(input_path, output_path, log_func=None):
-    data = input_path.read_bytes()
-    idx = data.find(b'moov')
-    if idx < 4:
-        if log_func:
-            log_func("[ERROR] moov atom not found")
-        return False
-    moov_start = idx - 4
-    moov_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
-    end = moov_start + moov_size
-    before = data[:moov_start]
-    after = data[end:]
-    relocated = before + after + data[moov_start:end]
-
-    if log_func:
-        log_func(f"[MOVE_MOOV] moov at {moov_start}, size {moov_size} → relocated to end ({len(relocated)} bytes)")
-        # verify moov is now at the end
-        last_moov = relocated.rfind(b'moov')
-        if last_moov > len(relocated) // 2:
-            log_func("[MOVE_MOOV] moov verified at end of file")
+def _adjust_stco(data, delta, search_start=0, search_end=None):
+    """Adjust all stco/co64 chunk-offset entries within search range by delta."""
+    if search_end is None:
+        search_end = len(data)
+    pos = search_start
+    while pos < search_end:
+        idx = data.find(b'stco', pos, search_end)
+        if idx == -1:
+            idx = data.find(b'co64', pos, search_end)
+            if idx == -1:
+                break
+            entry_size = 8
+            pos = idx + 1
         else:
-            log_func("[WARNING] moov position suspicious")
+            entry_size = 4
+            pos = idx + 1
+        entry_count = int.from_bytes(data[idx+8:idx+12], 'big')
+        off = idx + 12
+        for _ in range(entry_count):
+            old = int.from_bytes(data[off:off+entry_size], 'big')
+            new_val = old + delta
+            data[off:off+entry_size] = new_val.to_bytes(entry_size, 'big')
+            off += entry_size
 
-    output_path.write_bytes(relocated)
-    return True
+
+def relocate_to_non_faststart(data):
+    """Given data in Faststart layout (ftyp | moov | mdat):
+       1. Insert free(8) after ftyp
+       2. Adjust stco/co64 by -(moov_size - 8)
+       3. Physically move moov to end
+       Returns bytearray in Non-Faststart layout (ftyp | free | mdat | moov).
+    """
+    data = bytearray(data)
+
+    # 1. Insert free(8) after ftyp
+    ftyp_size = int.from_bytes(data[0:4], 'big')
+    free_atom = b'\x00\x00\x00\x08free'
+    data[ftyp_size:ftyp_size] = free_atom  # now: ftyp | free | moov | mdat
+
+    # 2. Find moov (right after free)
+    moov_start = ftyp_size + 8
+    moov_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
+    delta = -(moov_size - 8)  # = -(M - 8): correct for relocation + free atom
+    _adjust_stco(data, delta, moov_start, moov_start + moov_size)
+
+    # 3. Physically move moov to end
+    end = moov_start + moov_size
+    moov_box = data[moov_start:end]
+    del data[moov_start:end]
+    data.extend(moov_box)
+
+    return data
 
 
 def patch_all(input_path, output_path, comment="@akila", log_func=None):
@@ -312,15 +339,12 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     input_path = Path(input_path)
     output_path = Path(output_path)
 
-    # ---- 1. Two-pass remux to produce clean Non-Faststart ----
+    # ---- 1. Remux (Faststart, clean metadata) ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux → Faststart → Non-Faststart ────────────────────────")
-    front_path = input_path.parent / f"{input_path.stem}_front{input_path.suffix}"
-    clean_path = input_path.parent / f"{input_path.stem}_clean{input_path.suffix}"
-
-    # Pass 1: produce Faststart (moov at front) with clean metadata
-    cmd1 = [
+        log_func("── 1/7  Remux (Faststart, strip metadata) ────────────────────────")
+    front = input_path.parent / f"{input_path.stem}_front{input_path.suffix}"
+    cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-c", "copy",
@@ -329,104 +353,77 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         "-video_track_timescale", "90000",
         "-bitexact",
         "-map_metadata", "-1",
-        str(front_path),
+        str(front),
     ]
     if log_func:
-        log_func(f"[REMUX1] $ {' '.join(cmd1)}")
-    proc = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        log_func(f"[REMUX] $ {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
         line = line.rstrip()
         if line and log_func:
-            log_func(f"[ffmpeg1] {line}")
+            log_func(f"[ffmpeg] {line}")
     proc.wait()
     if proc.returncode != 0:
         if log_func:
-            log_func(f"[ERROR] ffmpeg pass 1 exited {proc.returncode}")
+            log_func(f"[ERROR] ffmpeg exited {proc.returncode}")
         return False
     if log_func:
-        log_func("[REMUX1] done")
+        log_func("[REMUX] done")
 
-    # Pass 2: default behavior (no +faststart) puts moov at end
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", str(front_path),
-        "-c", "copy",
-        str(clean_path),
-    ]
-    if log_func:
-        log_func(f"[REMUX2] $ {' '.join(cmd2)}")
-    proc = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line and log_func:
-            log_func(f"[ffmpeg2] {line}")
-    proc.wait()
-    if proc.returncode != 0:
-        if log_func:
-            log_func(f"[ERROR] ffmpeg pass 2 exited {proc.returncode}")
-        try: front_path.unlink(missing_ok=True)
-        except: pass
-        return False
-    if log_func:
-        log_func("[REMUX2] done")
-
-    # ---- 2. Read clean (Non-Faststart) file ----
-    data = clean_path.read_bytes()
-    if log_func:
-        log_func(f"[READ] {len(data):,} bytes")
-
-    # ---- 3. Insert free atom after ftyp ----
+    # ---- 2. Python relocation: free(8) + stco fixup + moov to end ----
     if log_func:
         log_func("")
-        log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
-    ftyp_size = int.from_bytes(data[0:4], 'big')
-    data = data[:ftyp_size] + b'\x00\x00\x00\x08free' + data[ftyp_size:]
+        log_func("── 2/7  Python: relocate moov to end ─────────────────────────────")
+    raw = front.read_bytes()
+    data = relocate_to_non_faststart(raw)
     if log_func:
-        log_func("[PATCH] free atom inserted (size=8)")
+        md = data.find(b'mdat')
+        mv = data.rfind(b'moov')
+        log_func(f"[RELOC] mdat at {md}, moov at {mv} → moov is now at end ({'YES' if mv > md else 'NO'})")
 
-    # ---- 4. Date zeroing ----
+    # ---- 3. Date zeroing ----
     if log_func:
         log_func("")
         log_func("── 3/7  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
-    # ---- 5. Language spoofing -> und ----
+    # ---- 4. Language spoofing -> und ----
     if log_func:
         log_func("")
         log_func("── 4/7  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
-    # ---- 6. Frame count inflation (10x) ----
+    # ---- 5. Frame count inflation (10x) ----
     if log_func:
         log_func("")
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    # Non-Faststart: pre_shift=8 (free atom shifts mdat), moov is after mdat
-    patched = inject_fake_frames(data, pre_shift=8, stts_overflow=True, moov_before_mdat=False)
+    # Stco already fixed by relocation; moov is after mdat (no extra shift)
+    patched = inject_fake_frames(data, pre_shift=0, stts_overflow=True, moov_before_mdat=False)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed")
-        for f in [clean_path, front_path]:
-            try: f.unlink(missing_ok=True)
-            except: pass
+        try: front.unlink(missing_ok=True)
+        except: pass
         return False
     data = bytearray(patched)
 
-    # ---- 7. Inject metadata (ilst) at end of moov ----
+    # ---- 6. Inject metadata (ilst) at end of moov ----
     if log_func:
         log_func("")
         log_func("── 6/7  Inject metadata (ilst box) ─────────────────────────────")
-    moov_atom_start = data.find(b'moov') - 4
-    current_moov_size = int.from_bytes(data[moov_atom_start:moov_atom_start+4], 'big')
-    moov_end = moov_atom_start + current_moov_size
+    moov_idx = data.rfind(b'moov')
+    moov_start = moov_idx - 4
+    current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
+    moov_end = moov_start + current_size
     data[moov_end:moov_end] = md_tree
-    new_moov_size = current_moov_size + md_growth
-    data[moov_atom_start:moov_atom_start+4] = new_moov_size.to_bytes(4, 'big')
+    new_size = current_size + md_growth
+    data[moov_start:moov_start+4] = new_size.to_bytes(4, 'big')
     if log_func:
-        log_func(f"[PATCH] metadata injected: moov {current_moov_size} -> {new_moov_size}")
+        log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}")
 
-    # ---- 8. Fake trailer atom ----
+    # ---- 7. Fake trailer atom ----
     if log_func:
         log_func("")
         log_func("── 7/7  Fake trailer atom ───────────────────────────────────────")
@@ -434,15 +431,14 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
-    # ---- 9. Write final output ----
+    # ---- 8. Write final output ----
     output_path.write_bytes(bytes(data))
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
 
     # Cleanup
-    for f in [clean_path, front_path]:
-        try: f.unlink(missing_ok=True)
-        except: pass
+    try: front.unlink(missing_ok=True)
+    except: pass
 
     if log_func:
         log_func(f"[DONE]  {output_path.name}")
