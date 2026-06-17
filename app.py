@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
 TikTok MP4 Patcher — Self-hosted VPS tool
-Implements all 7 structural patches reverse-engineered from confirmed
-working output (itzcrih method):
+Implements 10 structural patches:
 
   1. Brand spoofing     — ftyp: major=isom, minor=0x200, compat=[isom,iso2,avc1,mp41]
   2. Date zeroing       — mvhd/tkhd/mdhd creation_time + modification_time → 0
   3. Language spoofing  — mdhd language field → 'und' (0x55C4)
-  4. Frame count inflate— stts sample_count × 1.307 (confuses bitrate estimator)
-  5. Fake trailer atom  — append invalid-size box after mdat (triggers ExifTool warning)
-  6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 automatically during remux
-  7. Comment injection  — ffmpeg -metadata comment/artist injected during remux
+  4. Frame count inflate— stts: collapse to 1 entry, set count=19690, delta=1
+  5. Fake trailer atom  — append invalid-size box after mdat
+  6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 during remux
+  7. Comment injection  — ffmpeg -metadata comment injected during remux
+  8. Timescale fix      — mdhd timescale → 120 (120 fps)
+  9. stsz count         — sample_count → 19690 with constant sample size
+ 10. B-frame limiter    — ctts: cap non-zero offset entries at 2
 """
 
 import os, uuid, subprocess, threading, queue, struct, shutil
@@ -31,8 +33,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 _job_logs:   dict[str, queue.Queue] = {}
 _job_status: dict[str, str]         = {}
 _job_output: dict[str, str]         = {}
-
-FRAME_INFLATE = 1.307   # matches observed 15060 → 19690
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Box-tree helpers
@@ -160,9 +160,7 @@ def patch_language(data: bytes, log: queue.Queue) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch 4 — frame count inflation via stts rewrite
 # moov → trak(video) → mdia → minf → stbl → stts
-# stts body: [0]ver [1:4]flags [4:8]entry_count
-#             then entry_count × (4B sample_count + 4B sample_delta)
-# Strategy: collapse to 1 entry, inflate sample_count by FRAME_INFLATE
+# Collapse to 1 entry: count=19690, delta=1 (120fps with mdhd timescale=120)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_video_trak(data: bytes, trak_off: int, trak_sz: int) -> bool:
@@ -194,35 +192,25 @@ def patch_frame_count(data: bytes, log: queue.Queue) -> bytes:
 
         # Read current stts
         body_off  = stts_off + 8
-        # version(1) + flags(3) + entry_count(4) = 8 bytes
         entry_count = struct.unpack(">I", data[body_off+4:body_off+8])[0]
-        # Sum all sample_counts to get real total frames
-        real_frames = 0
-        duration_sum = 0
-        for i in range(entry_count):
-            base = body_off + 8 + i*8
-            sc = struct.unpack(">I", data[base:base+4])[0]
-            sd = struct.unpack(">I", data[base+4:base+8])[0]
-            real_frames  += sc
-            duration_sum += sc * sd
+        real_frames = sum(
+            struct.unpack(">I", data[body_off+8+i*8:body_off+8+i*8+4])[0]
+            for i in range(entry_count)
+        )
 
-        inflated = int(real_frames * FRAME_INFLATE)
-        new_delta = duration_sum // inflated if inflated > 0 else 1
+        TARGET = 19690
+        _log(log, f"[PATCH] stts  real_frames={real_frames} → {TARGET}  delta=1")
 
-        _log(log, f"[PATCH] stts  real_frames={real_frames} → {inflated} "
-                  f"(×{FRAME_INFLATE})  delta={new_delta}")
-
-        # Build new stts: 1 entry
+        # Build new stts: 1 entry, delta=1 (120fps with mdhd timescale=120)
         new_body = (
-            b"\x00\x00\x00\x00"                       # version + flags
-            + struct.pack(">I", 1)                     # entry_count = 1
-            + struct.pack(">I", inflated)              # sample_count
-            + struct.pack(">I", new_delta)             # sample_delta
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)           # entry_count = 1
+            + struct.pack(">I", TARGET)       # sample_count
+            + struct.pack(">I", 1)            # sample_delta = 1
         )
         new_stts = struct.pack(">I", 8+len(new_body)) + b"stts" + new_body
 
-        # The new stts is smaller than old (collapsed to 1 entry).
-        # Pad with a free box to keep all offsets valid.
+        # Pad with a free box to keep all offsets valid
         size_diff = stts_sz - len(new_stts)
         if size_diff >= 8:
             free_box = struct.pack(">I", size_diff) + b"free" + b"\x00"*(size_diff-8)
@@ -230,7 +218,6 @@ def patch_frame_count(data: bytes, log: queue.Queue) -> bytes:
         elif size_diff == 0:
             replacement = new_stts
         else:
-            # New is larger (rare: only when original had 0 or 1 entries)
             replacement = new_stts
 
         data = data[:stts_off] + replacement + data[stts_off+stts_sz:]
@@ -248,6 +235,100 @@ FAKE_TRAILER = struct.pack(">I", 2) + b"junk"   # size=2 → invalid
 def patch_fake_trailer(data: bytes, log: queue.Queue) -> bytes:
     _log(log, f"[PATCH] trailer  appending {len(FAKE_TRAILER)}-byte invalid atom")
     return data + FAKE_TRAILER
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 8 — mdhd timescale → 120 (120 fps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_mdhd_timescale(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        mdhd_off, _ = find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if mdhd_off == -1: continue
+        v = data[mdhd_off+8]
+        if v == 0:      ts_off = mdhd_off + 20  # ver+flags(4)+ctime(4)+mtime(4)
+        elif v == 1:    ts_off = mdhd_off + 32  # ver+flags(4)+ctime(8)+mtime(8)
+        else:           continue
+        current = struct.unpack(">I", data[ts_off:ts_off+4])[0]
+        _log(log, f"[PATCH] mdhd  timescale {current} → 120")
+        p = bytearray(data)
+        struct.pack_into(">I", p, ts_off, 120)
+        return bytes(p)
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 9 — stsz sample count → 19690
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1: continue
+        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1: continue
+        stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
+        if stsz_off == -1: continue
+
+        TARGET = 19690
+        sample_size = struct.unpack(">I", data[stsz_off+12:stsz_off+16])[0]
+        old_count   = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        p = bytearray(data)
+        if sample_size == 0:
+            default = 51200
+            if old_count > 0:
+                default = struct.unpack(">I", data[stsz_off+20:stsz_off+24])[0] or 51200
+            struct.pack_into(">I", p, stsz_off+12, default)
+        struct.pack_into(">I", p, stsz_off+16, TARGET)
+        _log(log, f"[PATCH] stsz  count {old_count} → {TARGET}")
+        return bytes(p)
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 10 — ctts B-frame limiter → 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_ctts_bframes(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1: continue
+        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1: continue
+        ctts_off, ctts_sz = find_box(data, b"ctts", stbl_off+8, stbl_off+stbl_sz)
+        if ctts_off == -1:
+            _log(log, "[WARN]  ctts not found — skipping B-frame patch")
+            return data
+
+        body_off = ctts_off + 8
+        entry_count = struct.unpack(">I", data[body_off+4:body_off+8])[0]
+        p = bytearray(data)
+        non_zero = 0
+        for i in range(entry_count):
+            off = body_off + 8 + i*8 + 4
+            val = struct.unpack(">i", data[off:off+4])[0]
+            if val != 0:
+                non_zero += 1
+                if non_zero > 2:
+                    struct.pack_into(">I", p, off, 0)
+        _log(log, f"[PATCH] ctts  B-frame entries → 2 (was {non_zero})")
+        return bytes(p)
+    return data
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Remux (patches 6 + 7 — encoder spoofing + comment injection)
@@ -294,33 +375,42 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, f"[JOB]  {job_id[:8]}… started")
         _log(log, f"[JOB]  input: {original_name}  ({src.stat().st_size:,} bytes)")
 
-        _log(log, ""); _log(log, "── 1/7  Remux + encoder spoof + comment inject ──────────────")
+        _log(log, ""); _log(log, "── 1/10 Remux + encoder spoof + comment inject ──────────────")
         if not remux(src, remuxed, comment, log): raise RuntimeError("Remux failed")
 
-        _log(log, ""); _log(log, "── 2/7  Reading remuxed file ────────────────────────────────")
+        _log(log, ""); _log(log, "── 2/10 Reading remuxed file ────────────────────────────────")
         raw = remuxed.read_bytes()
         _log(log, f"[READ] {len(raw):,} bytes")
 
-        _log(log, ""); _log(log, "── 3/7  ftyp brand spoof ────────────────────────────────────")
+        _log(log, ""); _log(log, "── 3/10 ftyp brand spoof ────────────────────────────────────")
         raw = patch_ftyp(raw, log)
 
-        _log(log, ""); _log(log, "── 4/7  Timestamp zeroing (mvhd / tkhd / mdhd) ─────────────")
+        _log(log, ""); _log(log, "── 4/10 Timestamp zeroing (mvhd / tkhd / mdhd) ─────────────")
         raw = patch_timestamps(raw, log)
 
-        _log(log, ""); _log(log, "── 5/7  Language spoof → 'und' ──────────────────────────────")
+        _log(log, ""); _log(log, "── 5/10 Language spoof → 'und' ──────────────────────────────")
         raw = patch_language(raw, log)
 
-        _log(log, ""); _log(log, "── 6/7  Frame count inflation (stts) ────────────────────────")
+        _log(log, ""); _log(log, "── 6/10 Frame count inflation (stts) ────────────────────────")
         raw = patch_frame_count(raw, log)
 
-        _log(log, ""); _log(log, "── 7/7  Fake trailer atom ───────────────────────────────────")
+        _log(log, ""); _log(log, "── 7/10 mdhd timescale → 120 (120 fps) ─────────────────────")
+        raw = patch_mdhd_timescale(raw, log)
+
+        _log(log, ""); _log(log, "── 8/10 stsz sample count → 19690 ───────────────────────────")
+        raw = patch_stsz_count(raw, log)
+
+        _log(log, ""); _log(log, "── 9/10 ctts B-frame limiter → 2 ────────────────────────────")
+        raw = patch_ctts_bframes(raw, log)
+
+        _log(log, ""); _log(log, "── 10/10 Fake trailer atom ───────────────────────────────────")
         raw = patch_fake_trailer(raw, log)
 
         out_path.write_bytes(raw)
         _log(log, f"\n[WRITE] {out_path.name}  ({out_path.stat().st_size:,} bytes)")
         _job_output[job_id] = f"{job_id}_{out_name}"
         _job_status[job_id] = "done"
-        _log(log, ""); _log(log, "── ALL 7 PATCHES APPLIED ✓ ──────────────────────────────────")
+        _log(log, ""); _log(log, "── ALL 10 PATCHES APPLIED ✓ ─────────────────────────────────")
         _log(log, f"[DONE]  {out_name}")
 
     except Exception as exc:
