@@ -381,10 +381,6 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         "-i", str(input_path),
         "-c", "copy",
         "-movflags", "-faststart",
-        "-brand", "isom",
-        "-video_track_timescale", "90000",
-        "-bitexact",
-        "-map_metadata", "-1",
         str(clean),
     ]
     if log_func:
