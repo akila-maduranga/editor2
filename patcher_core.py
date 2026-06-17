@@ -459,7 +459,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/10  Remux (Faststart, normalize layout) ──────────────────────")
+        log_func("── 1/9  Remux (Faststart, normalize layout) ──────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
@@ -467,7 +467,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         "-c", "copy",
         "-map_metadata", "-1",
         "-fflags", "+bitexact",
-        "-brand", "qt",
+        "-brand", "isom",
         "-movflags", "+faststart",
         "-metadata:s:a:0", "handler_name=SoundHandler",
         str(clean),
@@ -500,7 +500,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
     if log_func:
         log_func("")
-        log_func("── 2/10  Insert free atom after ftyp ───────────────────────────")
+        log_func("── 2/9  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     # Check whether ffmpeg already placed a free atom after ftyp
     next_type = data[ftyp_size+4:ftyp_size+8]
@@ -517,19 +517,19 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 4. Date zeroing ----
     if log_func:
         log_func("")
-        log_func("── 3/10  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
+        log_func("── 3/9  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
     # ---- 5. Language spoofing -> und ----
     if log_func:
         log_func("")
-        log_func("── 4/10  Language spoofing -> 'und' ────────────────────────────")
+        log_func("── 4/9  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
     # ---- 6. Frame count inflation (10x) ----
     if log_func:
         log_func("")
-        log_func(f"── 5/10  Frame inflation (10x, stts overflow) ──────────────────")
+        log_func(f"── 5/9  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
     # Faststart: free atom shifts moov+mdat; moov is before mdat
@@ -545,7 +545,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 7. Inject metadata (ilst) — replace existing udta or append ----
     if log_func:
         log_func("")
-        log_func("── 6/10  Inject metadata (ilst box) ─────────────────────────────")
+        log_func("── 6/9  Inject metadata (ilst box) ─────────────────────────────")
     moov_idx = data.rfind(b'moov')
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
@@ -582,7 +582,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 8. Remove ffmpeg free(8) between moov and mdat ----
     if log_func:
         log_func("")
-        log_func("── 7/10  Remove interleaved free(8) ────────────────────────────")
+        log_func("── 7/9  Remove interleaved free(8) ────────────────────────────")
     moov_end = moov_start + new_size
     ffmpeg_free_removed = 0
     if data[moov_end:moov_end+8] == b'\x00\x00\x00\x08free':
@@ -591,40 +591,38 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         if log_func:
             log_func("[CLEANUP] removed ffmpeg free(8) between moov and mdat")
 
-    # ---- 9. Relocate to non-faststart (moov after mdat) ----
+    # ---- 9. Relocate to non-faststart with dynamic padding ----
     if log_func:
         log_func("")
-        log_func("── 8/10  Relocate to non-faststart (moov after mdat) ────────────")
+        log_func("── 8/9  Relocate to non-faststart ──────────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     if data[ftyp_size:ftyp_size+8] == b'\x00\x00\x00\x08free':
-        # Remove free(8) + moov(b) from between ftyp and mdat
+        # Calculate dynamic free atom size based on moov size
+        # This ensures every video gets a unique, large offset
+        free_size = new_size * 2 + 100000
+        # Save moov, then replace [free(8)+moov] with [free(free_size)]
         saved_moov = data[ftyp_size+8:ftyp_size+8+new_size]
-        del data[ftyp_size:ftyp_size+8+new_size]
+        new_free = struct.pack('>I4s', free_size, b'free') + b'\x00' * (free_size - 8)
+        data[ftyp_size:ftyp_size+8+new_size] = new_free
         data.extend(saved_moov)
-        # mdat shifted left by (8 + new_size); adjust stco
-        total_shift = -(8 + new_size + ffmpeg_free_removed)
-        _adjust_stco(data, total_shift, ftyp_size, len(data))
+        # Adjust stco for mdat shift: new_mdat_data - old_mdat_data
+        # old_mdat_data = ftyp_size + 8 + new_size + ffmpeg_free_removed + 8
+        # new_mdat_data = ftyp_size + free_size + 8
+        # delta = free_size - new_size - ffmpeg_free_removed - 8
+        stco_delta = free_size - new_size - ffmpeg_free_removed - 8
+        _adjust_stco(data, stco_delta, ftyp_size, len(data))
         if log_func:
-            log_func(f"[RELOC] non-faststart: stco delta={total_shift:+d}, "
-                     f"mdat now at ftyp boundary (offset {ftyp_size})")
+            log_func(f"[RELOC] non-faststart: free({free_size}), "
+                     f"mdat offset={ftyp_size + free_size}, "
+                     f"stco delta={stco_delta:+d}")
     else:
         if log_func:
             log_func("[RELOC] expected free(8) after ftyp, skipping")
 
-    # ---- 9. Patch ftyp major brand to QuickTime ----
-    if log_func:
-        log_func("")
-        log_func("── 9/10  Patch ftyp brand to QuickTime ──────────────────────────")
-    if data[4:8] == b'ftyp':
-        data[8:12] = b'qt  '
-        data[12:16] = b'\x00\x00\x00\x00'
-        if log_func:
-            log_func(f"[FTYP] major brand -> qt  , minor -> 0")
-
     # ---- 10. Fake trailer atom ----
     if log_func:
         log_func("")
-        log_func("── 10/10  Fake trailer atom ───────────────────────────────────────")
+        log_func("── 9/9  Fake trailer atom ───────────────────────────────────────")
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")

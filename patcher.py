@@ -188,7 +188,7 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         "ffmpeg", "-y", "-i", input_path,
         "-c", "copy",
         "-map_metadata", "-1",
-        "-brand", "qt",
+        "-brand", "isom",
         "-video_track_timescale", "90000",
         "-movflags", "+faststart",
         "-bitexact",
@@ -250,11 +250,6 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         new_type = (int.from_bytes(cur_type, 'big') + 1).to_bytes(4, 'big')
         patched[mdat_pos:mdat_pos+4] = new_type
         print(f"MDAT type: {cur_type} -> {new_type}")
-
-    # Patch ftyp major brand to QuickTime
-    if patched[4:8] == b'ftyp':
-        patched[8:12] = b'qt  '
-        print("FTYP major brand -> qt  ")
 
     # Append fake atom with invalid size (4 bytes < 8 minimum)
     patched += b'\x00\x00\x00\x04xxxx'
