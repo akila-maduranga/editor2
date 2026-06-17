@@ -6,10 +6,10 @@ All 7 target patches:
   1. Date zeroing       — mvhd/tkhd/mdhd timestamps -> 0
   2. Language spoofing  — mdhd language field -> 'und'
   3. Frame inflation    — stsz entries x10 (stco/co64 adjusted)
-  4. MDAT corruption    -> triggers ExifTool warning
-  5. Fake trailer atom  -> 'Unknown trailer with invalid atom size'
-  6. Encoder spoofing   -> Lavf60.16.100 via ffmpeg
-  7. Comment injection  -> itunes ilst box
+  4. Encoder spoofing   -> Lavf60.16.100 via ffmpeg
+  5. Comment injection  -> itunes ilst box
+  6. Free atom insert   -> between ftyp and mdat
+  7. Fake trailer atom  -> 'Unknown trailer with invalid atom size'
 """
 
 import struct
@@ -377,21 +377,10 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func(f"[PATCH] metadata injected: moov {current_moov_size} -> {new_moov_size}")
 
-    # ---- 8. MDAT corruption + fake trailer ----
+    # ---- 8. Fake trailer atom ----
     if log_func:
         log_func("")
-        log_func("── 7/7  MDAT corruption + fake trailer atom ────────────────────")
-    mdat_pos = data.find(b'mdat')
-    if mdat_pos >= 4:
-        cur_type = data[mdat_pos:mdat_pos+4]
-        new_type = (int.from_bytes(cur_type, 'big') + 1).to_bytes(4, 'big')
-        data[mdat_pos:mdat_pos+4] = new_type
-        if log_func:
-            log_func(f"[PATCH] mdat type: {cur_type} -> {new_type}")
-    else:
-        if log_func:
-            log_func("[WARN]  mdat not found, skipping corruption")
-
+        log_func("── 7/7  Fake trailer atom ───────────────────────────────────────")
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
