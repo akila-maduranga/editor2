@@ -6,11 +6,7 @@ RUN apt-get update && apt-get install -y ffmpeg ca-certificates curl && \
     chmod a+r /etc/apt/keyrings/gpac.asc
 
 RUN . /etc/os-release && \
-    echo "Types: deb" > /etc/apt/sources.list.d/gpac.sources && \
-    echo "URIs: https://dist.gpac.io/gpac/linux/ubuntu" >> /etc/apt/sources.list.d/gpac.sources && \
-    echo "Suites: bookworm" >> /etc/apt/sources.list.d/gpac.sources && \
-    echo "Components: nightly" >> /etc/apt/sources.list.d/gpac.sources && \
-    echo "Signed-By: /etc/apt/keyrings/gpac.asc" >> /etc/apt/sources.list.d/gpac.sources
+    printf 'Types: deb\nURIs: https://dist.gpac.io/gpac/linux/%s\nSuites: %s\nComponents: main\nSigned-By: /etc/apt/keyrings/gpac.asc\n' "${ID}" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/gpac.sources
 
 RUN apt-get update && apt-get install -y gpac && rm -rf /var/lib/apt/lists/*
 
