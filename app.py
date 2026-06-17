@@ -24,7 +24,7 @@ _job_status: dict[str, str]         = {}
 _job_output: dict[str, str]         = {}
 
 
-def run_job(job_id: str, src: Path, original_name: str, comment: str):
+def run_job(job_id: str, src: Path, original_name: str, comment: str, artist: str, copyright_text: str):
     log = _job_logs[job_id]
     _job_status[job_id] = "running"
 
@@ -41,7 +41,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         def log_func(msg):
             log.put(msg)
 
-        success = patch_all(src, out_path, comment=comment, log_func=log_func)
+        success = patch_all(src, out_path, comment=comment, artist=artist, copyright_text=copyright_text, log_func=log_func)
 
         if success:
             _job_output[job_id] = f"{job_id}_{out_name}"
@@ -71,13 +71,46 @@ def upload():
         return jsonify({"error": "Only .mp4 files accepted"}), 400
 
     comment = request.form.get("comment", "@akila")
+    artist = request.form.get("artist", "akila")
+    copyright_text = request.form.get("copyright", "akila")
     job_id  = str(uuid.uuid4())
     dest    = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)
 
     _job_logs[job_id] = queue.Queue()
-    threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment, artist, copyright_text), daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/extract-metadata", methods=["POST"])
+def extract_metadata():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".mp4"):
+        return jsonify({"error": "Only .mp4 files accepted"}), 400
+
+    # Save temporarily
+    temp_path = UPLOAD_DIR / f"temp_{f.filename}"
+    f.save(temp_path)
+
+    try:
+        from patcher_core import extract_metadata_atoms
+        data = temp_path.read_bytes()
+        metadata = extract_metadata_atoms(data)
+        
+        # Convert to readable format
+        result = {}
+        for key, info in metadata.items():
+            key_name = key.decode('latin1', errors='replace')
+            result[key_name] = {
+                "value": info['value'],
+                "length": info['length']
+            }
+        
+        return jsonify({"metadata": result})
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 @app.route("/stream/<job_id>")

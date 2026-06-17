@@ -161,7 +161,58 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     return bytes(result)
 
 
-def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
+def extract_metadata_atoms(data):
+    """Extract existing metadata atoms with their exact byte lengths from udta/ilst."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return {}
+    
+    metadata = {}
+    udta_off, udta_sz = _find_box(data, b"udta", moov_off + 8, moov_off + moov_sz)
+    if udta_off == -1:
+        return metadata
+    
+    meta_off, meta_sz = _find_box(data, b"meta", udta_off + 8, udta_off + udta_sz)
+    if meta_off == -1:
+        return metadata
+    
+    ilst_off, ilst_sz = _find_box(data, b"ilst", meta_off + 8, meta_off + meta_sz)
+    if ilst_off == -1:
+        return metadata
+    
+    # Iterate through ilst entries
+    pos = ilst_off + 8
+    ilst_end = ilst_off + ilst_sz
+    while pos + 16 <= ilst_end:
+        atom_size = int.from_bytes(data[pos:pos+4], 'big')
+        atom_type = data[pos+4:pos+8]
+        if atom_size < 8 or pos + atom_size > ilst_end:
+            break
+        
+        # Look for data atom inside
+        data_off, data_sz = _find_box(data, b"data", pos + 8, pos + atom_size)
+        if data_off != -1 and data_sz >= 16:
+            # Extract the actual value (after 16-byte data header)
+            value_start = data_off + 16
+            value_len = data_sz - 16
+            if value_len > 0:
+                value_bytes = data[value_start:value_start + value_len]
+                try:
+                    value_str = value_bytes.decode('utf-8', errors='replace')
+                    metadata[atom_type] = {'value': value_str, 'length': value_len}
+                except:
+                    pass
+        
+        pos += atom_size
+    
+    return metadata
+
+
+def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100", original_metadata=None):
+    """
+    Build metadata tree with exact byte-level preservation.
+    If original_metadata is provided, pad values to match original lengths.
+    """
     entries = {}
     if encoder:
         entries[b'\xa9too'] = encoder
@@ -177,6 +228,17 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     ilst_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')
+        
+        # If original metadata exists for this key, pad to exact length
+        if original_metadata and tag_key in original_metadata:
+            orig_len = original_metadata[tag_key]['length']
+            if len(value_bytes) < orig_len:
+                # Pad with null bytes to match exact original length
+                value_bytes = value_bytes + b'\x00' * (orig_len - len(value_bytes))
+            elif len(value_bytes) > orig_len:
+                # Truncate if longer (should not happen in normal use)
+                value_bytes = value_bytes[:orig_len]
+        
         data_atom = struct.pack('>I4sII', 16 + len(value_bytes), b'data', 1, 0)
         data_atom += value_bytes
         ilst_entry = struct.pack('>I4s', 8 + len(data_atom), tag_key) + data_atom
@@ -431,7 +493,7 @@ def patch_audio_duration(data, original_duration):
     return bytes(p)
 
 
-def patch_all(input_path, output_path, comment=None, log_func=None):
+def patch_all(input_path, output_path, comment=None, artist=None, copyright_text=None, log_func=None):
     if log_func:
         log_func("[JOB] starting patch pipeline")
 
@@ -444,12 +506,25 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         ts = int(time.time())
         tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
         comment = f"Patched by method.akila - {tag}"
+    
+    if artist is None:
+        artist = "akila"
+    if copyright_text is None:
+        copyright_text = "akila"
 
-    # Save original audio duration before ffmpeg remux
+    # Save original audio duration and metadata before ffmpeg remux
     original_data = input_path.read_bytes()
     original_audio_dur = read_audio_duration(original_data)
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
+    
+    # Extract original metadata with exact byte lengths
+    original_metadata = extract_metadata_atoms(original_data)
+    if log_func and original_metadata:
+        log_func(f"[META] extracted {len(original_metadata)} metadata fields with exact byte lengths")
+        for key, info in original_metadata.items():
+            key_name = key.decode('latin1', errors='replace')
+            log_func(f"[META]   {key_name}: '{info['value']}' (length={info['length']})")
 
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
@@ -524,7 +599,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("")
         log_func(f"── 5/8  Frame inflation (10x, stts overflow) ──────────────────")
-    md_tree = build_metadata_tree("akila", "akila", comment)
+    md_tree = build_metadata_tree(artist, copyright_text, comment, original_metadata=original_metadata)
     md_growth = len(md_tree)
     # Faststart: free atom shifts moov+mdat; moov is before mdat
     patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=True, moov_before_mdat=True)
@@ -573,23 +648,28 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}"
                  f"  (removed udta={udta_removed}, added={md_growth}, net={net_shift:+d})")
 
-    # ---- 8. Relocate to non-faststart with exact MediaDataOffset ----
+    # ---- 7. Relocate to non-faststart with exact MediaDataOffset ----
     if log_func:
         log_func("")
         log_func("── 7/8  Relocate to non-faststart (MediaDataOffset=237436) ────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     if data[ftyp_size:ftyp_size+8] == b'\x00\x00\x00\x08free':
-        # Exact free size to place mdat_data at 237436
-        free_size = 237436 - ftyp_size - 8
+        # Calculate exact free size to place mdat at 237436
+        # The formula: ftyp_size + free_size + moov_size = 237436
+        # So: free_size = 237436 - ftyp_size - moov_size
+        free_size = 237436 - ftyp_size - new_size
         if free_size < 8:
             if log_func:
-                log_func(f"[RELOC] free_size too small ({free_size}), skipping")
+                log_func(f"[RELOC] free_size too small ({free_size}), using minimum 8")
+            free_size = 8
         else:
             saved_moov = data[ftyp_size+8:ftyp_size+8+new_size]
             new_free = struct.pack('>I4s', free_size, b'free') + b'\x00' * (free_size - 8)
             data[ftyp_size:ftyp_size+8+new_size] = new_free
             data.extend(saved_moov)
-            stco_delta = 237436 - (ftyp_size + new_size + 16)
+            # Calculate stco delta: mdat moves from (ftyp_size + 8 + new_size) to 237436
+            old_mdat_offset = ftyp_size + 8 + new_size
+            stco_delta = 237436 - old_mdat_offset
             _adjust_stco(data, stco_delta, ftyp_size, len(data))
             if log_func:
                 log_func(f"[RELOC] non-faststart: free({free_size}), "
