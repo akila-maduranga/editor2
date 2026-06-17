@@ -192,7 +192,7 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
     hdlr = struct.pack('>I4sI', 32, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdta')
-    hdlr += struct.pack('>III', 0, 0, 0)
+    hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
     udta_data += meta
@@ -375,6 +375,73 @@ def relocate_to_non_faststart(data, log_func=None):
     return data
 
 
+def read_audio_duration(data):
+    """Read the audio track's mdhd duration from file data."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return None
+    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        if tt != b"trak":
+            continue
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        if hdlr_off + 20 > len(data):
+            continue
+        if data[hdlr_off+16:hdlr_off+20] == b'soun':
+            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+            if mdhd_off == -1:
+                continue
+            version = data[mdhd_off+8]
+            if version == 0:
+                dur_off = mdhd_off + 24
+                if dur_off + 4 > len(data):
+                    return None
+                return int.from_bytes(data[dur_off:dur_off+4], 'big')
+            else:
+                dur_off = mdhd_off + 32
+                if dur_off + 8 > len(data):
+                    return None
+                return int.from_bytes(data[dur_off:dur_off+8], 'big')
+    return None
+
+
+def patch_audio_duration(data, original_duration):
+    """Restore audio track mdhd duration in patched data."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        if tt != b"trak":
+            continue
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        if hdlr_off + 20 > len(data):
+            continue
+        if data[hdlr_off+16:hdlr_off+20] == b'soun':
+            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+            if mdhd_off == -1:
+                continue
+            version = data[mdhd_off+8]
+            if version == 0:
+                dur_off = mdhd_off + 24
+                dur_size = 4
+            else:
+                dur_off = mdhd_off + 32
+                dur_size = 8
+            p = bytearray(data)
+            p[dur_off:dur_off+dur_size] = original_duration.to_bytes(dur_size, 'big')
+            return bytes(p)
+    return data
+
+
 def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[JOB] starting patch pipeline")
@@ -388,6 +455,12 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         ts = int(time.time())
         tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
         comment = f"Patched by method.akila - {tag}"
+
+    # Save original audio duration before ffmpeg remux
+    original_data = input_path.read_bytes()
+    original_audio_dur = read_audio_duration(original_data)
+    if log_func and original_audio_dur is not None:
+        log_func(f"[AUDIO] original duration={original_audio_dur}")
 
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
@@ -509,29 +582,41 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}"
                  f"  (removed udta={udta_removed}, added={md_growth}, net={net_shift:+d})")
 
-    # ---- 8. Expand ffmpeg's free(8) to hit target media_data_offset ----
+    # ---- 8. Expand padding after ftyp, remove moov-mdat free ----
     if log_func:
         log_func("")
-        log_func("── 7/8  Expand padding to target media_data_offset=237436 ──────")
-    moov_end = moov_start + new_size
-    # Check ffmpeg's free(8) is right after moov
-    if data[moov_end:moov_end+8] != b'\x00\x00\x00\x08free':
+        log_func("── 7/8  Expand padding after ftyp, target offset=237436 ────────")
+    target_offset = 237436
+    ftyp_size = int.from_bytes(data[0:4], 'big')
+    # Our free(8) is at ftyp_size (inserted at step 3)
+    if data[ftyp_size:ftyp_size+8] != b'\x00\x00\x00\x08free':
         if log_func:
-            log_func("[PADDING] expected free(8) after moov not found — skipping")
+            log_func("[PADDING] expected free(8) after ftyp not found — skipping")
     else:
-        target_offset = 237436
-        # mdat_data_offset = 48 + moov_size + free_size
-        needed_free_size = target_offset - 48 - new_size
-        if needed_free_size <= 8:
+        moov_end = moov_start + new_size
+        needed_free = target_offset - 40 - new_size  # 40=ftyp+free+mdat_hdr
+        if needed_free < 8:
             if log_func:
                 log_func(f"[PADDING] offset already >= {target_offset} — no change needed")
         else:
-            extra = needed_free_size - 8
-            new_free = struct.pack('>I4s', needed_free_size, b'free')
-            data[moov_end:moov_end+8] = new_free + b'\x00' * extra
-            _adjust_stco(data, extra, moov_start, moov_start + new_size)
+            # Remove ffmpeg's free(8) between moov and mdat (shifts mdat left by 8)
+            ffmpeg_free_removed = 0
+            if data[moov_end:moov_end+8] == b'\x00\x00\x00\x08free':
+                del data[moov_end:moov_end + 8]
+                ffmpeg_free_removed = 8
+                if log_func:
+                    log_func("[PADDING] removed moov-mdat free(8)")
+            # Expand our free after ftyp: free(8) -> free(needed_free)
+            new_free = struct.pack('>I4s', needed_free, b'free') + b'\x00' * (needed_free - 8)
+            data[ftyp_size:ftyp_size+8] = new_free
+            shift = needed_free - 8
+            moov_start += shift
+            stco_delta = shift - ffmpeg_free_removed
+            new_moov_end = moov_start + new_size
+            if stco_delta != 0:
+                _adjust_stco(data, stco_delta, moov_start, new_moov_end)
             if log_func:
-                log_func(f"[PADDING] free(8) -> free({needed_free_size})  (+{extra} bytes)")
+                log_func(f"[PADDING] free(8) -> free({needed_free})  (stco delta={stco_delta:+d})")
 
     # ---- 9. Fake trailer atom ----
     if log_func:
@@ -540,6 +625,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
+
+    # Restore original audio duration (ffmpeg may truncate it)
+    if original_audio_dur is not None:
+        fixed = patch_audio_duration(bytes(data), original_audio_dur)
+        if fixed is not None:
+            data = bytearray(fixed)
+            if log_func:
+                log_func(f"[AUDIO] restored duration to {original_audio_dur}")
 
     # ---- 10. Final verify ----
     if log_func:
