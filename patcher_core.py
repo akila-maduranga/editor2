@@ -312,38 +312,66 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     input_path = Path(input_path)
     output_path = Path(output_path)
 
-    # ---- 1. Remux (Non-Faststart, strip metadata) ----
+    # ---- 1. Two-pass remux to produce clean Non-Faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux (Non-Faststart) ────────────────────────────────────")
-    remuxed = input_path.parent / f"{input_path.stem}_remuxed{input_path.suffix}"
-    cmd = [
+        log_func("── 1/7  Remux → Faststart → Non-Faststart ────────────────────────")
+    front_path = input_path.parent / f"{input_path.stem}_front{input_path.suffix}"
+    clean_path = input_path.parent / f"{input_path.stem}_clean{input_path.suffix}"
+
+    # Pass 1: produce Faststart (moov at front) with clean metadata
+    cmd1 = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-c", "copy",
+        "-movflags", "+faststart",
         "-brand", "isom",
         "-video_track_timescale", "90000",
         "-bitexact",
         "-map_metadata", "-1",
-        str(remuxed),
+        str(front_path),
     ]
     if log_func:
-        log_func(f"[REMUX] $ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        log_func(f"[REMUX1] $ {' '.join(cmd1)}")
+    proc = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
         line = line.rstrip()
         if line and log_func:
-            log_func(f"[ffmpeg] {line}")
+            log_func(f"[ffmpeg1] {line}")
     proc.wait()
     if proc.returncode != 0:
         if log_func:
-            log_func(f"[ERROR] ffmpeg exited {proc.returncode}")
+            log_func(f"[ERROR] ffmpeg pass 1 exited {proc.returncode}")
         return False
     if log_func:
-        log_func("[REMUX] done")
+        log_func("[REMUX1] done")
 
-    # ---- 2. Read remuxed file ----
-    data = remuxed.read_bytes()
+    # Pass 2: default behavior (no +faststart) puts moov at end
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-i", str(front_path),
+        "-c", "copy",
+        str(clean_path),
+    ]
+    if log_func:
+        log_func(f"[REMUX2] $ {' '.join(cmd2)}")
+    proc = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line and log_func:
+            log_func(f"[ffmpeg2] {line}")
+    proc.wait()
+    if proc.returncode != 0:
+        if log_func:
+            log_func(f"[ERROR] ffmpeg pass 2 exited {proc.returncode}")
+        try: front_path.unlink(missing_ok=True)
+        except: pass
+        return False
+    if log_func:
+        log_func("[REMUX2] done")
+
+    # ---- 2. Read clean (Non-Faststart) file ----
+    data = clean_path.read_bytes()
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
 
@@ -379,8 +407,9 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed")
-        try: remuxed.unlink(missing_ok=True)
-        except: pass
+        for f in [clean_path, front_path]:
+            try: f.unlink(missing_ok=True)
+            except: pass
         return False
     data = bytearray(patched)
 
@@ -411,8 +440,9 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
 
     # Cleanup
-    try: remuxed.unlink(missing_ok=True)
-    except: pass
+    for f in [clean_path, front_path]:
+        try: f.unlink(missing_ok=True)
+        except: pass
 
     if log_func:
         log_func(f"[DONE]  {output_path.name}")
