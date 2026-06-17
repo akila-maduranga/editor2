@@ -11,8 +11,8 @@ Implements 10 structural patches:
   6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 during remux
   7. Comment injection  — ffmpeg -metadata comment injected during remux
   8. Timescale fix      — mdhd timescale → 120 (120 fps)
-  9. stsz count         — sample_count → 19690 with constant sample size
- 10. B-frame limiter    — ctts: cap non-zero offset entries at 2
+  9. B-frame limiter    — ctts: cap non-zero offset entries at 2
+ 10. stsz count         — skipped (modifying breaks stco/stsc frame mapping)
 """
 
 import os, uuid, subprocess, threading, queue, struct, shutil
@@ -279,19 +279,9 @@ def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
         if stbl_off == -1: continue
         stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
         if stsz_off == -1: continue
-
-        TARGET = 19690
-        sample_size = struct.unpack(">I", data[stsz_off+12:stsz_off+16])[0]
-        old_count   = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
-        p = bytearray(data)
-        if sample_size == 0:
-            default = 51200
-            if old_count > 0:
-                default = struct.unpack(">I", data[stsz_off+20:stsz_off+24])[0] or 51200
-            struct.pack_into(">I", p, stsz_off+12, default)
-        struct.pack_into(">I", p, stsz_off+16, TARGET)
-        _log(log, f"[PATCH] stsz  count {old_count} → {TARGET}")
-        return bytes(p)
+        old_count = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        _log(log, f"[SKIP]  stsz count {old_count} — not patched (breaks frame mapping)")
+        return data
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,7 +387,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, ""); _log(log, "── 7/10 mdhd timescale → 120 (120 fps) ─────────────────────")
         raw = patch_mdhd_timescale(raw, log)
 
-        _log(log, ""); _log(log, "── 8/10 stsz sample count → 19690 ───────────────────────────")
+        _log(log, ""); _log(log, "── 8/10 stsz sample count (skipped — breaks frame mapping) ──")
         raw = patch_stsz_count(raw, log)
 
         _log(log, ""); _log(log, "── 9/10 ctts B-frame limiter → 2 ────────────────────────────")
