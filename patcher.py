@@ -194,9 +194,10 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
         ilst_data += ilst_entry
 
     ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
-    hdlr = struct.pack('>I4sI', 32, b'hdlr', 0)
+    hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdta')
-    hdlr += struct.pack('>III', 0, 0, 0)
+    hdlr += b'appl' + struct.pack('>II', 0, 0)
+    hdlr += b'Metadata\x00'
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
     return struct.pack('>I4s', 8 + len(meta), b'udta') + meta

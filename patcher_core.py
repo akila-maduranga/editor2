@@ -190,9 +190,10 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
         ilst_data += ilst_entry
 
     ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
-    hdlr = struct.pack('>I4sI', 32, b'hdlr', 0)
+    hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdta')
-    hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
+    hdlr += b'appl' + struct.pack('>II', 0, 0)
+    hdlr += b'Metadata\x00'  # vendor=Apple, name="Metadata"
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
     udta_data += meta
@@ -375,71 +376,158 @@ def relocate_to_non_faststart(data, log_func=None):
     return data
 
 
-def read_audio_duration(data):
-    """Read the audio track's mdhd duration from file data."""
+def relocate_to_non_faststart_final(data, log_func=None):
+    """Convert layout from ftyp|free|moov|mdat to ftyp|free|mdat|moov.
+    The new free atom absorbs the moov's size so mdat stays at the same file offset
+    — no stco adjustment needed.
+    """
+    data = bytearray(data)
+
+    ftyp_size = int.from_bytes(data[0:4], 'big')
+
+    # Read free atom (right after ftyp)
+    free_size = int.from_bytes(data[ftyp_size:ftyp_size + 4], 'big')
+    free_type = data[ftyp_size + 4:ftyp_size + 8]
+
+    if free_type != b'free':
+        if log_func:
+            log_func("[RELOC] expected free after ftyp, skipping")
+        return data
+
+    # moov is right after free
+    moov_pos = ftyp_size + free_size
+    if moov_pos + 8 > len(data):
+        if log_func:
+            log_func("[RELOC] data too short for moov, skipping")
+        return data
+    moov_size = int.from_bytes(data[moov_pos:moov_pos + 4], 'big')
+    if data[moov_pos + 4:moov_pos + 8] != b'moov':
+        if log_func:
+            log_func("[RELOC] expected moov after free, skipping")
+        return data
+
+    # Save moov bytes
+    moov_box = data[moov_pos:moov_pos + moov_size]
+
+    # Delete moov — mdat shifts left by moov_size
+    del data[moov_pos:moov_pos + moov_size]
+
+    # New free size absorbs moov's former space to keep mdat at same offset
+    new_free_size = free_size + moov_size
+    new_free = struct.pack('>I4s', new_free_size, b'free') + b'\x00' * (new_free_size - 8)
+    data[ftyp_size:ftyp_size + free_size] = new_free
+
+    # Append moov at end (comes after mdat, before any future junk)
+    data.extend(moov_box)
+
+    if log_func:
+        log_func(f"[RELOC] non-faststart: free({free_size}) -> free({new_free_size}), "
+                 f"moov({moov_size}) moved to end, mdat offset preserved")
+    return data
+
+
+def _mdhd_dur_offset(data, mdhd_off):
+    """Return (dur_off, dur_size) for mdhd at mdhd_off, or None."""
+    if mdhd_off + 12 > len(data):
+        return None
+    version = data[mdhd_off + 8]
+    if version == 0:
+        off = mdhd_off + 24
+        if off + 4 > len(data):
+            return None
+        return (off, 4)
+    else:
+        off = mdhd_off + 32
+        if off + 8 > len(data):
+            return None
+        return (off, 8)
+
+
+def _find_audio_mdhd_via_tree(data, moov_off, moov_sz):
+    """Iterate moov box tree to find audio track mdhd (returns mdhd_off or None)."""
+    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off + 8, moov_off + moov_sz):
+        if tt != b"trak":
+            continue
+        mdia_off, _ = _find_box(data, b"mdia", trak_off + 8, trak_off + trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off + 8, mdia_off + mdia_sz)
+        if hdlr_off == -1 or hdlr_off + 20 > len(data):
+            continue
+        if data[hdlr_off + 16:hdlr_off + 20] != b'soun':
+            continue
+        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off + 8, mdia_off + mdia_sz)
+        if mdhd_off != -1:
+            return mdhd_off
+    return None
+
+
+def _find_audio_mdhd_binary(data, moov_off, moov_sz):
+    """Fallback: binary-scan for 'mdhd' within moov and verify it belongs to a soun track."""
+    moov_end = moov_off + moov_sz
+    pos = moov_off
+    while True:
+        off = data.find(b'mdhd', pos, moov_end)
+        if off == -1:
+            break
+        # quick sanity: preceding bytes look like a size value
+        if off >= 4:
+            sz = int.from_bytes(data[off - 4:off], 'big')
+            if sz < 16 or off + sz > moov_end:
+                pos = off + 4
+                continue
+            # walk up to find a trak parent with soun hdlr
+            up = off - 8
+            while up >= moov_off:
+                up_sz = int.from_bytes(data[up:up + 4], 'big')
+                up_ty = data[up + 4:up + 8]
+                if up_ty == b'trak':
+                    # check for soun hdlr within this trak
+                    hdlr_off = data.find(b'hdlr', up + 8, up + up_sz)
+                    if hdlr_off != -1 and hdlr_off + 20 <= len(data):
+                        if data[hdlr_off + 16:hdlr_off + 20] == b'soun':
+                            return off
+                    break
+                up -= 4
+        pos = off + 4
+    return None
+
+
+def _get_audio_mdhd_off(data):
+    """Locate audio track mdhd offset using tree iteration, falling back to binary scan."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        if tt != b"trak":
-            continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        if hdlr_off + 20 > len(data):
-            continue
-        if data[hdlr_off+16:hdlr_off+20] == b'soun':
-            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-            if mdhd_off == -1:
-                continue
-            version = data[mdhd_off+8]
-            if version == 0:
-                dur_off = mdhd_off + 24
-                if dur_off + 4 > len(data):
-                    return None
-                return int.from_bytes(data[dur_off:dur_off+4], 'big')
-            else:
-                dur_off = mdhd_off + 32
-                if dur_off + 8 > len(data):
-                    return None
-                return int.from_bytes(data[dur_off:dur_off+8], 'big')
-    return None
+    mdhd_off = _find_audio_mdhd_via_tree(data, moov_off, moov_sz)
+    if mdhd_off is not None:
+        return mdhd_off
+    return _find_audio_mdhd_binary(data, moov_off, moov_sz)
+
+
+def read_audio_duration(data):
+    """Read the audio track's mdhd duration from file data."""
+    mdhd_off = _get_audio_mdhd_off(data)
+    if mdhd_off is None:
+        return None
+    r = _mdhd_dur_offset(data, mdhd_off)
+    if r is None:
+        return None
+    dur_off, dur_size = r
+    return int.from_bytes(data[dur_off:dur_off + dur_size], 'big')
 
 
 def patch_audio_duration(data, original_duration):
     """Restore audio track mdhd duration in patched data."""
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
+    mdhd_off = _get_audio_mdhd_off(data)
+    if mdhd_off is None:
         return data
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        if tt != b"trak":
-            continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        if hdlr_off + 20 > len(data):
-            continue
-        if data[hdlr_off+16:hdlr_off+20] == b'soun':
-            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-            if mdhd_off == -1:
-                continue
-            version = data[mdhd_off+8]
-            if version == 0:
-                dur_off = mdhd_off + 24
-                dur_size = 4
-            else:
-                dur_off = mdhd_off + 32
-                dur_size = 8
-            p = bytearray(data)
-            p[dur_off:dur_off+dur_size] = original_duration.to_bytes(dur_size, 'big')
-            return bytes(p)
-    return data
+    r = _mdhd_dur_offset(data, mdhd_off)
+    if r is None:
+        return data
+    dur_off, dur_size = r
+    p = bytearray(data)
+    p[dur_off:dur_off + dur_size] = original_duration.to_bytes(dur_size, 'big')
+    return bytes(p)
 
 
 def patch_all(input_path, output_path, comment=None, log_func=None):
@@ -465,7 +553,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/8  Remux (Faststart, normalize layout) ──────────────────────")
+        log_func("── 1/9  Remux (Faststart, normalize layout) ──────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
@@ -503,7 +591,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
     if log_func:
         log_func("")
-        log_func("── 2/8  Insert free atom after ftyp ───────────────────────────")
+        log_func("── 2/9  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     # Check whether ffmpeg already placed a free atom after ftyp
     next_type = data[ftyp_size+4:ftyp_size+8]
@@ -520,19 +608,19 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 4. Date zeroing ----
     if log_func:
         log_func("")
-        log_func("── 3/8  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
+        log_func("── 3/9  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
     # ---- 5. Language spoofing -> und ----
     if log_func:
         log_func("")
-        log_func("── 4/8  Language spoofing -> 'und' ────────────────────────────")
+        log_func("── 4/9  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
     # ---- 6. Frame count inflation (10x) ----
     if log_func:
         log_func("")
-        log_func(f"── 5/8  Frame inflation (10x, stts overflow) ──────────────────")
+        log_func(f"── 5/9  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
     # Faststart: free atom shifts moov+mdat; moov is before mdat
@@ -548,7 +636,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 7. Inject metadata (ilst) — replace existing udta or append ----
     if log_func:
         log_func("")
-        log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
+        log_func("── 6/9  Inject metadata (ilst box) ─────────────────────────────")
     moov_idx = data.rfind(b'moov')
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
@@ -585,7 +673,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 8. Expand padding after ftyp, remove moov-mdat free ----
     if log_func:
         log_func("")
-        log_func("── 7/8  Expand padding after ftyp, target offset=237436 ────────")
+        log_func("── 7/9  Expand padding after ftyp, target offset=237436 ────────")
     target_offset = 237436
     ftyp_size = int.from_bytes(data[0:4], 'big')
     # Our free(8) is at ftyp_size (inserted at step 3)
@@ -618,10 +706,16 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
             if log_func:
                 log_func(f"[PADDING] free(8) -> free({needed_free})  (stco delta={stco_delta:+d})")
 
-    # ---- 9. Fake trailer atom ----
+    # ---- 9. Relocate to non-faststart (moov after mdat) ----
     if log_func:
         log_func("")
-        log_func("── 8/8  Fake trailer atom ───────────────────────────────────────")
+        log_func("── 8/9  Relocate to non-faststart (moov after mdat) ────────────")
+    data = relocate_to_non_faststart_final(data, log_func=log_func)
+
+    # ---- 10. Fake trailer atom ----
+    if log_func:
+        log_func("")
+        log_func("── 9/9  Fake trailer atom ────────────────────────────────────────")
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
@@ -634,7 +728,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
             if log_func:
                 log_func(f"[AUDIO] restored duration to {original_audio_dur}")
 
-    # ---- 10. Final verify ----
+    # ---- 11. Final verify ----
     if log_func:
         log_func("")
         log_func("── Atom layout ────────────────────────────────────────────────────")
@@ -642,8 +736,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         md = data.find(b'mdat')
         mv = data.find(b'moov')
         log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
+        ftyp_sz = int.from_bytes(data[0:4], 'big')
+        free_hex = data[ftyp_sz:ftyp_sz+4].hex(' ', 1).upper()
+        log_func(f"[VERIFY] free atom size hex: {free_hex}")
 
-    # ---- 11. Write final output ----
+    # ---- 12. Write final output ----
     output_path.write_bytes(bytes(data))
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
