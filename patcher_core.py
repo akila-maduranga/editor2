@@ -303,23 +303,49 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
             off += entry_size
 
 
-def relocate_to_non_faststart(data):
+def _dump_atoms(data, label="", log_func=None):
+    """Log all top-level atom positions for debugging."""
+    if not log_func:
+        return
+    i = 0
+    while i + 8 <= len(data):
+        size = int.from_bytes(data[i:i+4], 'big')
+        kind = data[i+4:i+8]
+        if size == 0:
+            size = len(data) - i
+        if log_func:
+            log_func(f"  [{label}]  offset {i:>8}  size {size:>8}  {kind.decode('latin1', errors='replace')}")
+        i += size
+        if i >= len(data):
+            break
+
+
+def relocate_to_non_faststart(data, log_func=None):
     """Given data in Faststart layout (ftyp | moov | mdat):
        1. Insert free(8) after ftyp
        2. Adjust stco/co64 by -(moov_size - 8)
        3. Physically move moov to end
        Returns bytearray in Non-Faststart layout (ftyp | free | mdat | moov).
     """
+    if log_func:
+        log_func("[RELOC] Initial layout (before relocation):")
+        _dump_atoms(data, "BEFORE", log_func)
+
     data = bytearray(data)
 
     # 1. Insert free(8) after ftyp
     ftyp_size = int.from_bytes(data[0:4], 'big')
     free_atom = b'\x00\x00\x00\x08free'
     data[ftyp_size:ftyp_size] = free_atom  # now: ftyp | free | moov | mdat
+    if log_func:
+        log_func(f"[RELOC] Inserted free(8) after ftyp (ftyp_size={ftyp_size})")
 
     # 2. Find moov (right after free)
     moov_start = ftyp_size + 8
     moov_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
+    if log_func:
+        log_func(f"[RELOC] moov at offset {moov_start}, size={moov_size}")
+        log_func(f"[RELOC] stco adjustment delta = -(M-8) = -({moov_size}-8) = {-(moov_size-8)}")
     delta = -(moov_size - 8)  # = -(M - 8): correct for relocation + free atom
     _adjust_stco(data, delta, moov_start, moov_start + moov_size)
 
@@ -328,6 +354,10 @@ def relocate_to_non_faststart(data):
     moov_box = data[moov_start:end]
     del data[moov_start:end]
     data.extend(moov_box)
+
+    if log_func:
+        log_func("[RELOC] Final layout (after relocation):")
+        _dump_atoms(data, "AFTER", log_func)
 
     return data
 
@@ -377,8 +407,11 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func("")
         log_func("── 2/7  Python: relocate moov to end ─────────────────────────────")
     raw = front.read_bytes()
+    if log_func:
+        log_func(f"[FRONT] {len(raw):,} bytes — top-level atoms:")
+        _dump_atoms(raw, "FRONT", log_func)
     # NOTE: relocate_to_non_faststart also inserts the free(8) atom
-    data = relocate_to_non_faststart(raw)
+    data = relocate_to_non_faststart(raw, log_func)
     if log_func:
         md = data.find(b'mdat')
         mv = data.rfind(b'moov')
@@ -438,10 +471,12 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
 
     # ---- 8. Final verify before write ----
     if log_func:
+        log_func("")
+        log_func("── Final atom layout ──────────────────────────────────────────────")
+        _dump_atoms(data, "FINAL", log_func)
         md = data.find(b'mdat')
         mv = data.rfind(b'moov')
-        log_func(f"[VERIFY] final: mdat at {md}, moov at {mv}")
-        log_func(f"[VERIFY] moov at end: {'YES' if mv > md else 'NO'}")
+        log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
 
     # ---- 9. Write final output ----
     output_path.write_bytes(bytes(data))
