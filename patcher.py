@@ -32,28 +32,6 @@ def read_atoms_in_range(data, offset, end_pos):
                           'start': offset, 'size': size})
         offset = atom_end
     return atoms, offset
-    atoms = []
-    while offset + 8 <= end_pos and offset + 8 <= len(data):
-        size = int.from_bytes(data[offset:offset+4], 'big')
-        if size == 0:
-            break
-        if size == 1:
-            size = int.from_bytes(data[offset+8:offset+16], 'big')
-            header_size = 16
-        else:
-            header_size = 8
-        atom_end = offset + size
-        if atom_end > end_pos:
-            atom_end = end_pos
-        name = bytes(data[offset+4:offset+8])
-        if name in CONTAINERS:
-            children, _ = read_atoms_in_range(data, offset + header_size, atom_end)
-            atoms.append({'name': name, 'children': children, 'start': offset, 'size': size})
-        else:
-            atoms.append({'name': name, 'data': bytes(data[offset+header_size:atom_end]),
-                          'start': offset, 'size': size})
-        offset = atom_end
-    return atoms, offset
 
 
 def find_atom(atoms, path):
@@ -174,10 +152,8 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     return bytes(result)
 
 
-def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
+def build_metadata_tree(artist, copyright, custom_tag):
     entries = {}
-    if encoder:
-        entries[b'\xa9too'] = encoder
     if artist:
         entries[b'\xa9ART'] = artist
     if copyright:
@@ -212,11 +188,10 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         "ffmpeg", "-y", "-i", input_path,
         "-c", "copy",
         "-map_metadata", "-1",
-        "-brand", "isom",
+        "-brand", "qt",
         "-video_track_timescale", "90000",
         "-movflags", "+faststart",
         "-bitexact",
-        "-metadata", "encoder=Lavf60.16.100",
     ]
     if title:
         ffmpeg_cmd += ["-metadata", f"title={title}"]
@@ -275,6 +250,11 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         new_type = (int.from_bytes(cur_type, 'big') + 1).to_bytes(4, 'big')
         patched[mdat_pos:mdat_pos+4] = new_type
         print(f"MDAT type: {cur_type} -> {new_type}")
+
+    # Patch ftyp major brand to QuickTime
+    if patched[4:8] == b'ftyp':
+        patched[8:12] = b'qt  '
+        print("FTYP major brand -> qt  ")
 
     # Append fake atom with invalid size (4 bytes < 8 minimum)
     patched += b'\x00\x00\x00\x04xxxx'
