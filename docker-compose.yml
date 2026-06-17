@@ -1,16 +1,6 @@
-version: "3.9"
-
 services:
-  patcher:
+  tiktok-patcher:
     build: .
-    container_name: tiktok-patcher
     ports:
       - "5000:5000"
-    volumes:
-      - uploads:/app/uploads
-      - outputs:/app/outputs
     restart: unless-stopped
-
-volumes:
-  uploads:
-  outputs:
