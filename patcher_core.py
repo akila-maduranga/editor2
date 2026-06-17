@@ -371,21 +371,21 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     stem = input_path.stem
     suffix = input_path.suffix
 
-    # ---- 1. Remux (Faststart, clean metadata) ----
+    # ---- 1. Remux to Non-Faststart via ffmpeg -movflags -faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux (Faststart) ─────────────────────────────────────────")
-    front = input_path.parent / f"{stem}_front{suffix}"
+        log_func("── 1/7  Remux (Non-Faststart, strip metadata) ─────────────────────")
+    clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-c", "copy",
-        "-movflags", "+faststart",
+        "-movflags", "-faststart",
         "-brand", "isom",
         "-video_track_timescale", "90000",
         "-bitexact",
         "-map_metadata", "-1",
-        str(front),
+        str(clean),
     ]
     if log_func:
         log_func(f"[REMUX] $ {' '.join(cmd)}")
@@ -402,52 +402,52 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[REMUX] done")
 
-    # ---- 2. Python relocation: free(8) + stco fixup + moov to end ----
+    # ---- 2. Read clean file (moov at end) ----
+    data = clean.read_bytes()
     if log_func:
-        log_func("")
-        log_func("── 2/7  Python: relocate moov to end ─────────────────────────────")
-    raw = front.read_bytes()
-    if log_func:
-        log_func(f"[FRONT] {len(raw):,} bytes — top-level atoms:")
-        _dump_atoms(raw, "FRONT", log_func)
-    # NOTE: relocate_to_non_faststart also inserts the free(8) atom
-    data = relocate_to_non_faststart(raw, log_func)
-    if log_func:
+        log_func(f"[READ] {len(data):,} bytes")
         md = data.find(b'mdat')
         mv = data.rfind(b'moov')
-        log_func(f"[RELOC] mdat at offset {md}, moov at offset {mv}")
-        log_func(f"[RELOC] moov is at end: {'YES' if mv > md else 'NO'}")
-        log_func(f"[RELOC] layout: ftyp | free(8) | mdat | moov ✓")
+        log_func(f"[CHECK] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
 
-    # ---- 3. Date zeroing ----
+    # ---- 3. Insert free atom after ftyp ----
+    if log_func:
+        log_func("")
+        log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
+    ftyp_size = int.from_bytes(data[0:4], 'big')
+    data = data[:ftyp_size] + b'\x00\x00\x00\x08free' + data[ftyp_size:]
+    if log_func:
+        log_func("[PATCH] free atom inserted (size=8)")
+
+    # ---- 4. Date zeroing ----
     if log_func:
         log_func("")
         log_func("── 3/7  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
-    # ---- 4. Language spoofing -> und ----
+    # ---- 5. Language spoofing -> und ----
     if log_func:
         log_func("")
         log_func("── 4/7  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
-    # ---- 5. Frame count inflation (10x) ----
+    # ---- 6. Frame count inflation (10x) ----
     if log_func:
         log_func("")
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    # Non-Faststart: stco already correct from relocation, moov at end
-    patched = inject_fake_frames(data, pre_shift=0, stts_overflow=True, moov_before_mdat=False)
+    # Non-Faststart: free(8) shifts mdat; moov is after mdat
+    patched = inject_fake_frames(data, pre_shift=8, stts_overflow=True, moov_before_mdat=False)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed")
-        try: front.unlink(missing_ok=True)
+        try: clean.unlink(missing_ok=True)
         except: pass
         return False
     data = bytearray(patched)
 
-    # ---- 6. Inject metadata (ilst) at end of moov ----
+    # ---- 7. Inject metadata (ilst) at end of moov ----
     if log_func:
         log_func("")
         log_func("── 6/7  Inject metadata (ilst box) ─────────────────────────────")
@@ -461,7 +461,7 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}")
 
-    # ---- 7. Fake trailer atom ----
+    # ---- 8. Fake trailer atom ----
     if log_func:
         log_func("")
         log_func("── 7/7  Fake trailer atom ───────────────────────────────────────")
@@ -469,22 +469,22 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
-    # ---- 8. Final verify before write ----
+    # ---- 9. Final verify ----
     if log_func:
         log_func("")
-        log_func("── Final atom layout ──────────────────────────────────────────────")
+        log_func("── Atom layout ────────────────────────────────────────────────────")
         _dump_atoms(data, "FINAL", log_func)
         md = data.find(b'mdat')
         mv = data.rfind(b'moov')
         log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
 
-    # ---- 9. Write final output ----
+    # ---- 10. Write final output ----
     output_path.write_bytes(bytes(data))
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
 
     # Cleanup
-    try: front.unlink(missing_ok=True)
+    try: clean.unlink(missing_ok=True)
     except: pass
 
     if log_func:
