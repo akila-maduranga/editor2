@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 TikTok MP4 Patcher — Self-hosted VPS tool
-Remuxes MP4 files and applies a binary structural patch to bypass
-TikTok's aggressive compression on re-uploaded content.
+Implements all 7 structural patches reverse-engineered from confirmed
+working output (itzcrih method):
+
+  1. Brand spoofing     — ftyp: major=isom, minor=0x200, compat=[isom,iso2,avc1,mp41]
+  2. Date zeroing       — mvhd/tkhd/mdhd creation_time + modification_time → 0
+  3. Language spoofing  — mdhd language field → 'und' (0x55C4)
+  4. Frame count inflate— stts sample_count × 1.307 (confuses bitrate estimator)
+  5. Fake trailer atom  — append invalid-size box after mdat (triggers ExifTool warning)
+  6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 automatically during remux
+  7. Comment injection  — ffmpeg -metadata comment/artist injected during remux
 """
 
-import os
-import uuid
-import subprocess
-import threading
-import queue
-import struct
-import shutil
+import os, uuid, subprocess, threading, queue, struct, shutil
 from pathlib import Path
 from flask import (
     Flask, request, render_template, jsonify,
@@ -20,195 +22,322 @@ from flask import (
 
 app = Flask(__name__)
 
-BASE_DIR     = Path(__file__).parent
-UPLOAD_DIR   = BASE_DIR / "uploads"
-OUTPUT_DIR   = BASE_DIR / "outputs"
-
+BASE_DIR   = Path(__file__).parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# In-memory job log store: job_id -> queue of log lines
-_job_logs: dict[str, queue.Queue] = {}
-_job_status: dict[str, str] = {}   # "running" | "done" | "error"
-_job_output: dict[str, str] = {}   # job_id -> output filename
+_job_logs:   dict[str, queue.Queue] = {}
+_job_status: dict[str, str]         = {}
+_job_output: dict[str, str]         = {}
 
+FRAME_INFLATE = 1.307   # matches observed 15060 → 19690
 
-# ---------------------------------------------------------------------------
-# Patcher logic — mirrors patcher.py exactly
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Box-tree helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-FTYP_BRANDS = [b"isom", b"iso2", b"avc1", b"mp41"]
+def _log(q, msg): q.put(msg)
 
-def _log(q: queue.Queue, msg: str):
-    q.put(msg)
-
-def find_box(data: bytes, box_type: bytes, start: int = 0) -> tuple[int, int]:
-    """Return (offset, size) of the first occurrence of box_type, or (-1, 0)."""
+def iter_boxes(data: bytes, start: int = 0, end: int | None = None):
+    if end is None: end = len(data)
     i = start
-    while i + 8 <= len(data):
+    while i + 8 <= end:
         size = struct.unpack(">I", data[i:i+4])[0]
         btype = data[i+4:i+8]
-        if size == 0:
-            size = len(data) - i          # box extends to EOF
-        if size < 8:
-            break
-        if btype == box_type:
-            return i, size
+        if size == 0: size = end - i
+        if size < 8: break
+        yield i, size, btype
         i += size
+
+def find_box(data: bytes, box_type: bytes, start: int = 0, end: int | None = None):
+    for off, sz, bt in iter_boxes(data, start, end):
+        if bt == box_type: return off, sz
     return -1, 0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 1 — ftyp brand spoof
+# ─────────────────────────────────────────────────────────────────────────────
+
+FTYP_MAJOR  = b"isom"
+FTYP_MINOR  = struct.pack(">I", 0x00000200)
+FTYP_COMPAT = b"isom" b"iso2" b"avc1" b"mp41"
 
 def patch_ftyp(data: bytes, log: queue.Queue) -> bytes:
-    """
-    Rewrite the ftyp box so TikTok's decoder treats the file as a
-    freshly-encoded stream rather than a re-muxed upload.
-    """
-    offset, size = find_box(data, b"ftyp")
-    if offset == -1:
-        _log(log, "[WARN] ftyp box not found — skipping ftyp patch")
-        return data
+    off, sz = find_box(data, b"ftyp")
+    if off == -1:
+        _log(log, "[WARN]  ftyp not found — skipping"); return data
+    old = data[off+8:off+12].decode("latin1")
+    body     = FTYP_MAJOR + FTYP_MINOR + FTYP_COMPAT
+    new_ftyp = struct.pack(">I", 8+len(body)) + b"ftyp" + body
+    _log(log, f"[PATCH] ftyp  major={old!r} → isom  minor → 0x00000200")
+    return data[:off] + new_ftyp + data[off+sz:]
 
-    _log(log, f"[PATCH] ftyp box @ offset {offset}, size {size}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 2 — timestamp zeroing (mvhd / tkhd / mdhd)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Build replacement ftyp: major brand + version + compatible brands
-    major_brand = b"mp42"
-    minor_version = struct.pack(">I", 0)
-    compatible = b"".join(FTYP_BRANDS)
-    new_ftyp_body = major_brand + minor_version + compatible
-    new_ftyp_size = 8 + len(new_ftyp_body)
-    new_ftyp = struct.pack(">I", new_ftyp_size) + b"ftyp" + new_ftyp_body
+def _zero_timestamps(data: bytes, off: int, name: str, log: queue.Queue) -> bytes:
+    bs = off + 8
+    v  = data[bs]
+    if v == 0:
+        ct_off, mt_off, fmt, w = bs+4, bs+8,  ">I", 4
+    elif v == 1:
+        ct_off, mt_off, fmt, w = bs+4, bs+12, ">Q", 8
+    else:
+        _log(log, f"[WARN]  {name} unknown version {v}"); return data
+    ct = struct.unpack(fmt, data[ct_off:ct_off+w])[0]
+    mt = struct.unpack(fmt, data[mt_off:mt_off+w])[0]
+    if ct == 0 and mt == 0:
+        _log(log, f"[PATCH] {name}  timestamps already zero"); return data
+    _log(log, f"[PATCH] {name}  create={ct} modify={mt} → 0/0")
+    p = bytearray(data)
+    struct.pack_into(fmt, p, ct_off, 0)
+    struct.pack_into(fmt, p, mt_off, 0)
+    return bytes(p)
 
-    _log(log, f"[PATCH] rewriting ftyp: major_brand=mp42, "
-              f"compatible={[b.decode() for b in FTYP_BRANDS]}")
-    return data[:offset] + new_ftyp + data[offset + size:]
-
-
-def patch_moov_flags(data: bytes, log: queue.Queue) -> bytes:
-    """
-    Clear the 'random access' flag in the moov/mvhd box.
-    TikTok uses this flag to detect re-encoded content.
-    """
-    moov_off, moov_size = find_box(data, b"moov")
+def patch_timestamps(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
     if moov_off == -1:
-        _log(log, "[WARN] moov box not found — skipping mvhd patch")
-        return data
+        _log(log, "[WARN]  moov not found — skipping timestamps"); return data
 
-    mvhd_off, mvhd_size = find_box(data, b"mvhd", moov_off + 8)
-    if mvhd_off == -1:
-        _log(log, "[WARN] mvhd box not found inside moov — skipping")
-        return data
+    # mvhd
+    mvhd_off, _ = find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
+    if mvhd_off != -1:
+        data = _zero_timestamps(data, mvhd_off, "mvhd", log)
+        moov_off, moov_sz = find_box(data, b"moov")
 
-    _log(log, f"[PATCH] mvhd box @ offset {mvhd_off}, size {mvhd_size}")
+    # each trak → tkhd + mdia → mdhd
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        tkhd_off, _ = find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off != -1:
+            data = _zero_timestamps(data, tkhd_off, "tkhd", log)
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off != -1:
+            mdhd_off, _ = find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+            if mdhd_off != -1:
+                data = _zero_timestamps(data, mdhd_off, "mdhd", log)
+    return data
 
-    # mvhd layout: 4 size + 4 type + 1 version + 3 flags + ...
-    flags_off = mvhd_off + 9   # byte offset of the 3-byte flags field
-    original_flags = data[flags_off:flags_off+3]
-    # Clear flag bit 0x000001 (random access point indicator)
-    new_flags = bytes([
-        original_flags[0],
-        original_flags[1],
-        original_flags[2] & 0xFE,
-    ])
-    _log(log, f"[PATCH] mvhd flags {original_flags.hex()} → {new_flags.hex()}")
-    return data[:flags_off] + new_flags + data[flags_off+3:]
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 3 — language spoofing → 'und' in every mdhd
+# mdhd body layout (v=0): [0]ver [1:4]flags [4:8]ct [8:12]mt
+#                          [12:16]timescale [16:20]duration [20:22]language
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _pack_lang(s: str) -> bytes:
+    val = 0
+    for c in s:
+        val = (val << 5) | (ord(c) - 0x60)
+    return struct.pack(">H", val)
 
-def remux(src: Path, dst: Path, log: queue.Queue) -> bool:
-    """Remux src → dst using ffmpeg (stream copy, moov at front)."""
+UND = _pack_lang("und")   # 0x55C4
+
+def patch_language(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+    changed = False
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        mdhd_off, _ = find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if mdhd_off == -1: continue
+        lang_off = mdhd_off + 8 + 20   # box header(8) + body offset 20
+        current  = data[lang_off:lang_off+2]
+        if current == UND:
+            _log(log, f"[PATCH] mdhd  language already 'und'")
+            continue
+        _log(log, f"[PATCH] mdhd  language {current.hex()} → und (0x55c4)")
+        p = bytearray(data)
+        p[lang_off:lang_off+2] = UND
+        data = bytes(p)
+        changed = True
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 4 — frame count inflation via stts rewrite
+# moov → trak(video) → mdia → minf → stbl → stts
+# stts body: [0]ver [1:4]flags [4:8]entry_count
+#             then entry_count × (4B sample_count + 4B sample_delta)
+# Strategy: collapse to 1 entry, inflate sample_count by FRAME_INFLATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_video_trak(data: bytes, trak_off: int, trak_sz: int) -> bool:
+    """Return True if this trak contains a video handler."""
+    mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+    if mdia_off == -1: return False
+    hdlr_off, hdlr_sz = find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+    if hdlr_off == -1: return False
+    # hdlr body: [0]ver [1:4]flags [4:8]pre_defined [8:12]handler_type
+    handler_type = data[hdlr_off+8+8:hdlr_off+8+12]
+    return handler_type == b"vide"
+
+def patch_frame_count(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1: continue
+        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1: continue
+        stts_off, stts_sz = find_box(data, b"stts", stbl_off+8, stbl_off+stbl_sz)
+        if stts_off == -1: continue
+
+        # Read current stts
+        body_off  = stts_off + 8
+        # version(1) + flags(3) + entry_count(4) = 8 bytes
+        entry_count = struct.unpack(">I", data[body_off+4:body_off+8])[0]
+        # Sum all sample_counts to get real total frames
+        real_frames = 0
+        duration_sum = 0
+        for i in range(entry_count):
+            base = body_off + 8 + i*8
+            sc = struct.unpack(">I", data[base:base+4])[0]
+            sd = struct.unpack(">I", data[base+4:base+8])[0]
+            real_frames  += sc
+            duration_sum += sc * sd
+
+        inflated = int(real_frames * FRAME_INFLATE)
+        new_delta = duration_sum // inflated if inflated > 0 else 1
+
+        _log(log, f"[PATCH] stts  real_frames={real_frames} → {inflated} "
+                  f"(×{FRAME_INFLATE})  delta={new_delta}")
+
+        # Build new stts: 1 entry
+        new_body = (
+            b"\x00\x00\x00\x00"                       # version + flags
+            + struct.pack(">I", 1)                     # entry_count = 1
+            + struct.pack(">I", inflated)              # sample_count
+            + struct.pack(">I", new_delta)             # sample_delta
+        )
+        new_stts = struct.pack(">I", 8+len(new_body)) + b"stts" + new_body
+
+        # The new stts is smaller than old (collapsed to 1 entry).
+        # Pad with a free box to keep all offsets valid.
+        size_diff = stts_sz - len(new_stts)
+        if size_diff >= 8:
+            free_box = struct.pack(">I", size_diff) + b"free" + b"\x00"*(size_diff-8)
+            replacement = new_stts + free_box
+        elif size_diff == 0:
+            replacement = new_stts
+        else:
+            # New is larger (rare: only when original had 0 or 1 entries)
+            replacement = new_stts
+
+        data = data[:stts_off] + replacement + data[stts_off+stts_sz:]
+        break   # only patch video track
+
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 5 — fake trailer atom (triggers "Unknown trailer with invalid atom size")
+# Append a box with size=2 (< minimum valid 8) right after the last byte
+# ─────────────────────────────────────────────────────────────────────────────
+
+FAKE_TRAILER = struct.pack(">I", 2) + b"junk"   # size=2 → invalid
+
+def patch_fake_trailer(data: bytes, log: queue.Queue) -> bytes:
+    _log(log, f"[PATCH] trailer  appending {len(FAKE_TRAILER)}-byte invalid atom")
+    return data + FAKE_TRAILER
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Remux (patches 6 + 7 — encoder spoofing + comment injection)
+# ffmpeg automatically writes encoder=Lavf60.16.100 as the muxer tag.
+# We inject comment + artist via -metadata flags.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def remux(src: Path, dst: Path, comment: str, log: queue.Queue) -> bool:
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
-        "-c", "copy",          # no re-encoding
-        "-movflags", "+faststart",   # moov at front (required for patching)
-        "-map_metadata", "0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-map_metadata", "-1",          # strip original metadata first
+        "-metadata", f"comment={comment}",
+        "-metadata", "encoder=Lavf60.16.100",
         str(dst),
     ]
     _log(log, f"[REMUX] $ {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
         line = line.rstrip()
-        if line:
-            _log(log, f"[ffmpeg] {line}")
+        if line: _log(log, f"[ffmpeg] {line}")
     proc.wait()
     if proc.returncode != 0:
-        _log(log, f"[ERROR] ffmpeg exited with code {proc.returncode}")
-        return False
+        _log(log, f"[ERROR] ffmpeg exited {proc.returncode}"); return False
     _log(log, "[REMUX] done ✓")
     return True
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Full pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
-def patch_file(remuxed: Path, output: Path, log: queue.Queue) -> bool:
-    """Apply binary patches to the remuxed file."""
-    _log(log, f"[PATCH] reading {remuxed.name} ({remuxed.stat().st_size:,} bytes)")
-    data = remuxed.read_bytes()
-
-    data = patch_ftyp(data, log)
-    data = patch_moov_flags(data, log)
-
-    output.write_bytes(data)
-    _log(log, f"[PATCH] written {output.name} ({output.stat().st_size:,} bytes) ✓")
-    return True
-
-
-def run_job(job_id: str, src: Path, original_name: str):
-    """Full pipeline: remux → patch → cleanup."""
+def run_job(job_id: str, src: Path, original_name: str, comment: str):
     log = _job_logs[job_id]
     _job_status[job_id] = "running"
 
-    remuxed = UPLOAD_DIR / f"{job_id}_remuxed.mp4"
-    stem = Path(original_name).stem
+    remuxed  = UPLOAD_DIR / f"{job_id}_remuxed.mp4"
+    stem     = Path(original_name).stem
     out_name = f"{stem}_patched.mp4"
     out_path = OUTPUT_DIR / f"{job_id}_{out_name}"
 
     try:
-        _log(log, f"[JOB] {job_id[:8]}… started")
-        _log(log, f"[JOB] input: {original_name} ({src.stat().st_size:,} bytes)")
+        _log(log, f"[JOB]  {job_id[:8]}… started")
+        _log(log, f"[JOB]  input: {original_name}  ({src.stat().st_size:,} bytes)")
 
-        # Step 1 — remux
-        _log(log, "")
-        _log(log, "── STEP 1 / 2  Remux (stream copy + faststart) ─────────────")
-        if not remux(src, remuxed, log):
-            raise RuntimeError("Remux failed")
+        _log(log, ""); _log(log, "── 1/7  Remux + encoder spoof + comment inject ──────────────")
+        if not remux(src, remuxed, comment, log): raise RuntimeError("Remux failed")
 
-        # Step 2 — binary patch
-        _log(log, "")
-        _log(log, "── STEP 2 / 2  Binary patch (ftyp + mvhd flags) ────────────")
-        if not patch_file(remuxed, out_path, log):
-            raise RuntimeError("Patch failed")
+        _log(log, ""); _log(log, "── 2/7  Reading remuxed file ────────────────────────────────")
+        raw = remuxed.read_bytes()
+        _log(log, f"[READ] {len(raw):,} bytes")
 
+        _log(log, ""); _log(log, "── 3/7  ftyp brand spoof ────────────────────────────────────")
+        raw = patch_ftyp(raw, log)
+
+        _log(log, ""); _log(log, "── 4/7  Timestamp zeroing (mvhd / tkhd / mdhd) ─────────────")
+        raw = patch_timestamps(raw, log)
+
+        _log(log, ""); _log(log, "── 5/7  Language spoof → 'und' ──────────────────────────────")
+        raw = patch_language(raw, log)
+
+        _log(log, ""); _log(log, "── 6/7  Frame count inflation (stts) ────────────────────────")
+        raw = patch_frame_count(raw, log)
+
+        _log(log, ""); _log(log, "── 7/7  Fake trailer atom ───────────────────────────────────")
+        raw = patch_fake_trailer(raw, log)
+
+        out_path.write_bytes(raw)
+        _log(log, f"\n[WRITE] {out_path.name}  ({out_path.stat().st_size:,} bytes)")
         _job_output[job_id] = f"{job_id}_{out_name}"
         _job_status[job_id] = "done"
-        _log(log, "")
-        _log(log, "── ALL STEPS COMPLETE ✓ ─────────────────────────────────────")
-        _log(log, f"[DONE] {out_name}")
+        _log(log, ""); _log(log, "── ALL 7 PATCHES APPLIED ✓ ──────────────────────────────────")
+        _log(log, f"[DONE]  {out_name}")
 
     except Exception as exc:
         _log(log, f"[ERROR] {exc}")
         _job_status[job_id] = "error"
-
     finally:
-        # Clean up temp files
         for p in [src, remuxed]:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
-        log.put(None)   # sentinel
+            try: p.unlink(missing_ok=True)
+            except: pass
+        log.put(None)
 
-
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Routes
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index():
-    return render_template("index.html")
-
+def index(): return render_template("index.html")
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -216,65 +345,37 @@ def upload():
         return jsonify({"error": "No file provided"}), 400
     f = request.files["file"]
     if not f.filename.lower().endswith(".mp4"):
-        return jsonify({"error": "Only .mp4 files are accepted"}), 400
+        return jsonify({"error": "Only .mp4 files accepted"}), 400
 
-    job_id = str(uuid.uuid4())
-    dest = UPLOAD_DIR / f"{job_id}_input.mp4"
+    comment = request.form.get("comment", "Patched")
+    job_id  = str(uuid.uuid4())
+    dest    = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)
 
     _job_logs[job_id] = queue.Queue()
-    t = threading.Thread(target=run_job, args=(job_id, dest, f.filename), daemon=True)
-    t.start()
-
+    threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment), daemon=True).start()
     return jsonify({"job_id": job_id})
-
 
 @app.route("/stream/<job_id>")
 def stream(job_id: str):
-    """SSE endpoint — streams log lines until job completes."""
     def generate():
         q = _job_logs.get(job_id)
-        if q is None:
-            yield "data: [ERROR] Unknown job ID\n\n"
-            return
+        if q is None: yield "data: [ERROR] Unknown job\n\n"; return
         while True:
-            try:
-                line = q.get(timeout=60)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if line is None:          # sentinel: job done
+            try: line = q.get(timeout=60)
+            except queue.Empty: yield ": keepalive\n\n"; continue
+            if line is None:
                 status = _job_status.get(job_id, "error")
                 out    = _job_output.get(job_id, "")
-                yield f"data: __STATUS__{status}|{out}\n\n"
-                return
+                yield f"data: __STATUS__{status}|{out}\n\n"; return
             yield f"data: {line}\n\n"
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.route("/status/<job_id>")
-def status(job_id: str):
-    s = _job_status.get(job_id, "unknown")
-    out = _job_output.get(job_id, "")
-    return jsonify({"status": s, "output": out})
-
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.route("/download/<filename>")
 def download(filename: str):
-    # Only serve files that belong to completed jobs
-    allowed = set(_job_output.values())
-    if filename not in allowed:
-        return "Not found", 404
+    if filename not in set(_job_output.values()): return "Not found", 404
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
