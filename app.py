@@ -12,7 +12,8 @@ Implements 10 structural patches:
   7. Comment injection  — ffmpeg -metadata comment injected during remux
   8. Timescale fix      — mdhd timescale → 120 (120 fps)
   9. B-frame limiter    — ctts: cap non-zero offset entries at 2
- 10. stsz count         — skipped (modifying breaks stco/stsc frame mapping)
+ 10. Bitrate spoof      — inject btrt box in stsd→avc1 with 18 Mbps
+ 11. stsz count         — skipped (modifying breaks stco/stsc frame mapping)
 """
 
 import os, uuid, subprocess, threading, queue, struct, shutil
@@ -321,6 +322,72 @@ def patch_ctts_bframes(data: bytes, log: queue.Queue) -> bytes:
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Patch 11 — btrt bitrate box → 18 Mbps
+# MediaInfo calculates bitrate as stream_size×8/duration.  The stts inflation
+# (19690@120fps → 164s) drops calculated bitrate 10×.  We inject a btrt box
+# inside stsd→avc1 with explicit avgBitrate/maxBitrate — MediaInfo reads this
+# in preference to the calculation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_bitrate(data: bytes, log: queue.Queue) -> bytes:
+    TARGET = 18_000_000
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1: continue
+        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1: continue
+        stsd_off, stsd_sz = find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1: continue
+
+        # Walk sample entries inside stsd
+        pos = stsd_off + 16  # size(4)+type(4)+ver+flags(4)+entry_count(4)
+        while pos + 16 < stsd_off + stsd_sz:
+            entry_sz = struct.unpack(">I", data[pos:pos+4])[0]
+            entry_ty = data[pos+4:pos+8]
+            if entry_sz < 8: break
+            if entry_ty not in (b"avc1", b"hvc1", b"hev1", b"mp4v"):
+                pos += entry_sz
+                continue
+
+            # Look for existing btrt box inside this entry
+            btrt_off, btrt_sz = find_box(data, b"btrt", pos+8, pos+entry_sz)
+            if btrt_off != -1:
+                p = bytearray(data)
+                struct.pack_into(">I", p, btrt_off+12, TARGET)  # maxBitrate
+                struct.pack_into(">I", p, btrt_off+16, TARGET)  # avgBitrate
+                _log(log, f"[PATCH] btrt  bitrate → {TARGET:,} bps (existing box)")
+                return bytes(p)
+
+            # No btrt — create one after avcC
+            avcC_off, avcC_sz = find_box(data, b"avcC", pos+8, pos+entry_sz)
+            insert_off = (avcC_off + avcC_sz) if avcC_off != -1 else (pos + entry_sz)
+            btrt_box = struct.pack(">I", 20) + b"btrt" + struct.pack(">III", TARGET, TARGET, TARGET)
+            delta = len(btrt_box)
+
+            p = bytearray(data)
+            # Expand the sample entry
+            struct.pack_into(">I", p, pos, entry_sz + delta)
+            # Insert btrt
+            p[insert_off:insert_off] = btrt_box
+            # Update parent container sizes
+            for poff in (stsd_off, stbl_off, minf_off, mdia_off, trak_off, moov_off):
+                old = struct.unpack(">I", p[poff:poff+4])[0]
+                struct.pack_into(">I", p, poff, old + delta)
+            _log(log, f"[PATCH] btrt  created → {TARGET:,} bps")
+            return bytes(p)
+
+    _log(log, "[WARN]  btrt  no video sample entry found — skipping")
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Remux (patches 6 + 7 — encoder spoofing + comment injection)
 # ffmpeg automatically writes encoder=Lavf60.16.100 as the muxer tag.
 # We inject comment + artist via -metadata flags.
@@ -365,42 +432,45 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, f"[JOB]  {job_id[:8]}… started")
         _log(log, f"[JOB]  input: {original_name}  ({src.stat().st_size:,} bytes)")
 
-        _log(log, ""); _log(log, "── 1/10 Remux + encoder spoof + comment inject ──────────────")
+        _log(log, ""); _log(log, "── 1/11 Remux + encoder spoof + comment inject ──────────────")
         if not remux(src, remuxed, comment, log): raise RuntimeError("Remux failed")
 
-        _log(log, ""); _log(log, "── 2/10 Reading remuxed file ────────────────────────────────")
+        _log(log, ""); _log(log, "── 2/11 Reading remuxed file ────────────────────────────────")
         raw = remuxed.read_bytes()
         _log(log, f"[READ] {len(raw):,} bytes")
 
-        _log(log, ""); _log(log, "── 3/10 ftyp brand spoof ────────────────────────────────────")
+        _log(log, ""); _log(log, "── 3/11 ftyp brand spoof ────────────────────────────────────")
         raw = patch_ftyp(raw, log)
 
-        _log(log, ""); _log(log, "── 4/10 Timestamp zeroing (mvhd / tkhd / mdhd) ─────────────")
+        _log(log, ""); _log(log, "── 4/11 Timestamp zeroing (mvhd / tkhd / mdhd) ─────────────")
         raw = patch_timestamps(raw, log)
 
-        _log(log, ""); _log(log, "── 5/10 Language spoof → 'und' ──────────────────────────────")
+        _log(log, ""); _log(log, "── 5/11 Language spoof → 'und' ──────────────────────────────")
         raw = patch_language(raw, log)
 
-        _log(log, ""); _log(log, "── 6/10 Frame count inflation (stts) ────────────────────────")
+        _log(log, ""); _log(log, "── 6/11 Frame count inflation (stts) ────────────────────────")
         raw = patch_frame_count(raw, log)
 
-        _log(log, ""); _log(log, "── 7/10 mdhd timescale → 120 (120 fps) ─────────────────────")
+        _log(log, ""); _log(log, "── 7/11 mdhd timescale → 120 (120 fps) ─────────────────────")
         raw = patch_mdhd_timescale(raw, log)
 
-        _log(log, ""); _log(log, "── 8/10 stsz sample count (skipped — breaks frame mapping) ──")
+        _log(log, ""); _log(log, "── 8/11 stsz sample count (skipped — breaks frame mapping) ──")
         raw = patch_stsz_count(raw, log)
 
-        _log(log, ""); _log(log, "── 9/10 ctts B-frame limiter → 2 ────────────────────────────")
+        _log(log, ""); _log(log, "── 9/11 ctts B-frame limiter → 2 ────────────────────────────")
         raw = patch_ctts_bframes(raw, log)
 
-        _log(log, ""); _log(log, "── 10/10 Fake trailer atom ───────────────────────────────────")
+        _log(log, ""); _log(log, "── 10/11 btrt bitrate box → 18 Mbps ─────────────────────────")
+        raw = patch_bitrate(raw, log)
+
+        _log(log, ""); _log(log, "── 11/11 Fake trailer atom ───────────────────────────────────")
         raw = patch_fake_trailer(raw, log)
 
         out_path.write_bytes(raw)
         _log(log, f"\n[WRITE] {out_path.name}  ({out_path.stat().st_size:,} bytes)")
         _job_output[job_id] = f"{job_id}_{out_name}"
         _job_status[job_id] = "done"
-        _log(log, ""); _log(log, "── ALL 10 PATCHES APPLIED ✓ ─────────────────────────────────")
+        _log(log, ""); _log(log, "── ALL 11 PATCHES APPLIED ✓ ─────────────────────────────────")
         _log(log, f"[DONE]  {out_name}")
 
     except Exception as exc:
