@@ -16,6 +16,8 @@ import struct
 import subprocess
 from pathlib import Path
 
+_SCRIPT_DIR = Path(__file__).parent
+
 CONTAINERS = [b'moov', b'trak', b'mdia', b'minf', b'stbl', b'edts', b'udta', b'meta', b'ilst']
 VERSION_ATOMS = [b'meta']
 
@@ -283,6 +285,7 @@ def remux(input_path, output_path, comment, log_func=None):
         "-c", "copy",
         "-brand", "isom",
         "-video_track_timescale", "90000",
+        "-movflags", "+faststart",
         "-bitexact",
         "-map_metadata", "-1",
         "-metadata", "encoder=Lavf60.16.100",
@@ -307,26 +310,27 @@ def remux(input_path, output_path, comment, log_func=None):
     return True
 
 
-def mp4box_relocate(input_path, output_path, log_func=None):
+def move_moov_to_end(input_path, output_path, log_func=None):
+    script = _SCRIPT_DIR / "move_moov_to_end.sh"
     cmd = [
-        "MP4Box", "-inter", "0",
+        "bash", str(script),
         str(input_path),
-        "-out", str(output_path),
+        str(output_path),
     ]
     if log_func:
-        log_func(f"[MP4BOX] $ {' '.join(cmd)}")
+        log_func(f"[MOVE_MOOV] $ {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
         line = line.rstrip()
         if line and log_func:
-            log_func(f"[mp4box] {line}")
+            log_func(f"[move_moov] {line}")
     proc.wait()
     if proc.returncode != 0:
         if log_func:
-            log_func(f"[ERROR] MP4Box exited {proc.returncode}")
+            log_func(f"[ERROR] move_moov_to_end.sh exited {proc.returncode}")
         return False
     if log_func:
-        log_func("[MP4BOX] done (moov relocated to end)")
+        log_func("[MOVE_MOOV] done")
     return True
 
 
@@ -337,7 +341,7 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     input_path = Path(input_path)
     output_path = Path(output_path)
 
-    # ---- 1. Remux ----
+    # ---- 1. Remux (Faststart, with metadata) ----
     if log_func:
         log_func("")
         log_func("── 1/7  Remux + encoder spoof + comment injection ──────────────")
@@ -345,15 +349,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if not remux(input_path, remuxed, comment, log_func):
         return False
 
-    # ---- 1b. MP4Box: relocate moov to end (Non-Faststart) ----
-    relocated = input_path.parent / f"{input_path.stem}_relocated{input_path.suffix}"
-    if not mp4box_relocate(remuxed, relocated, log_func):
-        if log_func:
-            log_func("[WARN] MP4Box failed, falling back to remuxed file")
-        relocated = remuxed
-
-    # ---- 2. Read file ----
-    data = relocated.read_bytes()
+    # ---- 2. Read remuxed file ----
+    data = remuxed.read_bytes()
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
 
@@ -384,13 +381,12 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    patched = inject_fake_frames(data, pre_shift=8, stts_overflow=True, moov_before_mdat=False)
+    patched = inject_fake_frames(data, pre_shift=8 + md_growth, stts_overflow=True, moov_before_mdat=True)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed (moov/trak/stsz not found)")
-        for f in [relocated, remuxed]:
-            try: f.unlink(missing_ok=True)
-            except: pass
+        try: remuxed.unlink(missing_ok=True)
+        except: pass
         return False
     data = bytearray(patched)
 
@@ -415,17 +411,26 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
-    # ---- Write output ----
-    output_path.write_bytes(data)
+    # ---- 9. Write patched (Faststart) temp file ----
+    patched_path = input_path.parent / f"{input_path.stem}_patched{input_path.suffix}"
+    patched_path.write_bytes(bytes(data))
     if log_func:
-        log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
+        log_func(f"[WRITE] temp patched: {patched_path.name}  ({len(data):,} bytes)")
+
+    # ---- 10. Move moov to end via move_moov_to_end.sh ----
+    if log_func:
         log_func("")
-        log_func("── ALL 7 PATCHES APPLIED ───────────────────────────────────────")
-        log_func(f"[DONE]  {output_path.name}")
+        log_func("── 8/8  Relocate moov to end (Non-Faststart) ───────────────────")
+    if not move_moov_to_end(patched_path, output_path, log_func):
+        if log_func:
+            log_func("[ERROR] moov relocation failed, keeping Faststart output")
+        output_path.write_bytes(bytes(data))
 
     # Cleanup
-    for f in [relocated, remuxed]:
+    for f in [patched_path, remuxed]:
         try: f.unlink(missing_ok=True)
         except: pass
 
+    if log_func:
+        log_func(f"[DONE]  {output_path.name}")
     return True
