@@ -172,15 +172,8 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     if custom_tag:
         entries[b'\xa9cmt'] = custom_tag
 
-    # Build as direct children of udta (Windows-compatible)
+    # Build Apple-style meta/ilst/data wrapper
     udta_data = b''
-    for tag_key, value in entries.items():
-        value_bytes = value.encode('utf-8')
-        # Direct: size + type + value (Windows reads this)
-        tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
-        udta_data += tag_box
-
-    # Also add Apple-style meta/ilst/data wrapper for compatibility
     ilst_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')
@@ -191,7 +184,7 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
 
     ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
     hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
-    hdlr += struct.pack('>I4s', 0, b'mdta')
+    hdlr += struct.pack('>I4s', 0, b'mdir')
     hdlr += b'appl' + struct.pack('>II', 0, 0)
     hdlr += b'Metadata\x00'  # vendor=Apple, name="Metadata"
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
@@ -461,7 +454,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux (Faststart, normalize layout) ──────────────────────")
+        log_func("── 1/8  Remux (Faststart, normalize layout) ──────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
@@ -501,7 +494,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
     if log_func:
         log_func("")
-        log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
+        log_func("── 2/8  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     # Check whether ffmpeg already placed a free atom after ftyp
     next_type = data[ftyp_size+4:ftyp_size+8]
@@ -518,19 +511,19 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 4. Date zeroing ----
     if log_func:
         log_func("")
-        log_func("── 3/7  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
+        log_func("── 3/8  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
     # ---- 5. Language spoofing -> und ----
     if log_func:
         log_func("")
-        log_func("── 4/7  Language spoofing -> 'und' ────────────────────────────")
+        log_func("── 4/8  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
     # ---- 6. Frame count inflation (10x) ----
     if log_func:
         log_func("")
-        log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
+        log_func(f"── 5/8  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
     # Faststart: free atom shifts moov+mdat; moov is before mdat
@@ -546,7 +539,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ---- 7. Inject metadata (ilst) — replace existing udta or append ----
     if log_func:
         log_func("")
-        log_func("── 6/7  Inject metadata (ilst box) ─────────────────────────────")
+        log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
     moov_idx = data.rfind(b'moov')
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
@@ -580,10 +573,35 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}"
                  f"  (removed udta={udta_removed}, added={md_growth}, net={net_shift:+d})")
 
-    # ---- 8. Fake trailer atom ----
+    # ---- 8. Relocate to non-faststart with exact MediaDataOffset ----
     if log_func:
         log_func("")
-        log_func("── 7/7  Fake trailer atom ────────────────────────────────────────")
+        log_func("── 7/8  Relocate to non-faststart (MediaDataOffset=237436) ────")
+    ftyp_size = int.from_bytes(data[0:4], 'big')
+    if data[ftyp_size:ftyp_size+8] == b'\x00\x00\x00\x08free':
+        # Exact free size to place mdat_data at 237436
+        free_size = 237436 - ftyp_size - 8
+        if free_size < 8:
+            if log_func:
+                log_func(f"[RELOC] free_size too small ({free_size}), skipping")
+        else:
+            saved_moov = data[ftyp_size+8:ftyp_size+8+new_size]
+            new_free = struct.pack('>I4s', free_size, b'free') + b'\x00' * (free_size - 8)
+            data[ftyp_size:ftyp_size+8+new_size] = new_free
+            data.extend(saved_moov)
+            stco_delta = 237436 - (ftyp_size + new_size + 16)
+            _adjust_stco(data, stco_delta, ftyp_size, len(data))
+            if log_func:
+                log_func(f"[RELOC] non-faststart: free({free_size}), "
+                         f"media_data_offset=237436, stco delta={stco_delta:+d}")
+    else:
+        if log_func:
+            log_func("[RELOC] expected free(8) after ftyp, skipping")
+
+    # ---- 9. Fake trailer atom ----
+    if log_func:
+        log_func("")
+        log_func("── 8/8  Fake trailer atom ────────────────────────────────────────")
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
@@ -596,16 +614,20 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
             if log_func:
                 log_func(f"[AUDIO] restored duration to {original_audio_dur}")
 
-    # ---- 9. Final verify ----
+    # ---- 11. Final verify ----
     if log_func:
         log_func("")
         log_func("── Atom layout ────────────────────────────────────────────────────")
         _dump_atoms(data, "FINAL", log_func)
         md = data.find(b'mdat')
         mv = data.find(b'moov')
-        log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
+        log_func(f"[VERIFY] mdat at {md}, moov at {mv}, {'non-faststart' if mv > md else 'faststart'}")
         log_func(f"[VERIFY] media_data_offset={md}, media_data_size={len(data) - md - 8}")
         log_func(f"[VERIFY] ftyp major brand: {data[8:12].decode('latin1', errors='replace')!r}")
+        f_sz = int.from_bytes(data[0:4], 'big')
+        if data[f_sz:f_sz+4] == b'free':
+            free_hex = data[f_sz:f_sz+4].hex(' ', 1).upper()
+            log_func(f"[VERIFY] free atom size hex: {free_hex}")
 
     # ---- 10. Write final output ----
     output_path.write_bytes(bytes(data))
