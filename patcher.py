@@ -152,8 +152,10 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     return bytes(result)
 
 
-def build_metadata_tree(artist, copyright, custom_tag):
+def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     entries = {}
+    if encoder:
+        entries[b'\xa9too'] = encoder
     if artist:
         entries[b'\xa9ART'] = artist
     if copyright:
@@ -191,7 +193,6 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         "-brand", "isom",
         "-video_track_timescale", "90000",
         "-movflags", "+faststart",
-        "-bitexact",
     ]
     if title:
         ffmpeg_cmd += ["-metadata", f"title={title}"]
