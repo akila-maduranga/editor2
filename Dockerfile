@@ -1,15 +1,22 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Install Python deps first (layer cache)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy app
+COPY app.py .
+COPY templates/ templates/
 
-RUN mkdir -p uploads outputs && chmod +x move_moov_to_end.sh move_moov_to_end.py
+# Writable dirs for uploads and outputs
+RUN mkdir -p uploads outputs
 
 EXPOSE 5000
 

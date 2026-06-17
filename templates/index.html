@@ -287,35 +287,6 @@
     <div id="file-name"></div>
   </div>
 
-  <!-- Metadata section -->
-  <div id="metadata-section" style="display: none; border: 1px solid var(--border); border-radius: 6px; padding: 16px;">
-    <div style="font-size: 11px; color: var(--cyan); font-weight: 700; margin-bottom: 12px; letter-spacing: 0.05em;">METADATA (BIT-LEVEL PRESERVATION)</div>
-    
-    <div style="display: flex; flex-direction: column; gap: 12px;">
-      <div>
-        <label style="font-size: 11px; color: var(--muted); display: block; margin-bottom: 4px;">Artist (©ART)</label>
-        <input type="text" id="meta-artist" style="width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; color: var(--text); font-family: var(--mono); font-size: 12px;">
-        <div id="meta-artist-length" style="font-size: 10px; color: var(--muted); margin-top: 4px;"></div>
-      </div>
-      
-      <div>
-        <label style="font-size: 11px; color: var(--muted); display: block; margin-bottom: 4px;">Copyright (©cpy)</label>
-        <input type="text" id="meta-copyright" style="width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; color: var(--text); font-family: var(--mono); font-size: 12px;">
-        <div id="meta-copyright-length" style="font-size: 10px; color: var(--muted); margin-top: 4px;"></div>
-      </div>
-      
-      <div>
-        <label style="font-size: 11px; color: var(--muted); display: block; margin-bottom: 4px;">Comment (©cmt)</label>
-        <input type="text" id="meta-comment" style="width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; color: var(--text); font-family: var(--mono); font-size: 12px;">
-        <div id="meta-comment-length" style="font-size: 10px; color: var(--muted); margin-top: 4px;"></div>
-      </div>
-    </div>
-    
-    <div style="font-size: 10px; color: var(--muted); margin-top: 12px; line-height: 1.5;">
-      Values will be padded with null bytes to match original byte lengths exactly, preventing structural shifts.
-    </div>
-  </div>
-
   <!-- Pipeline steps -->
   <div class="pipeline">
     <div class="step">
@@ -366,13 +337,8 @@
   const indicator  = document.getElementById('log-status-indicator');
   const dlSection  = document.getElementById('download-section');
   const dlBtn      = document.getElementById('download-btn');
-  const metaSection = document.getElementById('metadata-section');
-  const metaArtist = document.getElementById('meta-artist');
-  const metaCopyright = document.getElementById('meta-copyright');
-  const metaComment = document.getElementById('meta-comment');
 
   let selectedFile = null;
-  let originalMetadata = {};
 
   // ── Drag & drop ──
   dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -384,73 +350,18 @@
   });
   fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
 
-  async function handleFile(f) {
+  function handleFile(f) {
     if (!f.name.toLowerCase().endsWith('.mp4')) {
       fileName.textContent = '✗ Only .mp4 files accepted';
       fileName.style.color = 'var(--red)';
       runBtn.disabled = true;
-      metaSection.style.display = 'none';
       return;
     }
     selectedFile = f;
     const mb = (f.size / 1048576).toFixed(1);
     fileName.textContent = `✓ ${f.name}  (${mb} MB)`;
     fileName.style.color = 'var(--cyan)';
-    runBtn.disabled = false; // Enable button immediately
-    
-    // Extract metadata asynchronously (non-blocking)
-    metaSection.style.display = 'block';
-    metaArtist.value = 'akila';
-    metaCopyright.value = 'akila';
-    metaComment.value = '@akila';
-    document.getElementById('meta-artist-length').textContent = 'Loading...';
-    document.getElementById('meta-copyright-length').textContent = 'Loading...';
-    document.getElementById('meta-comment-length').textContent = 'Loading...';
-    
-    try {
-      const fd = new FormData();
-      fd.append('file', f);
-      const res = await fetch('/extract-metadata', { method: 'POST', body: fd });
-      const json = await res.json();
-      
-      if (json.metadata) {
-        originalMetadata = json.metadata;
-        
-        // Populate fields
-        if (json.metadata['©ART']) {
-          metaArtist.value = json.metadata['©ART'].value;
-          document.getElementById('meta-artist-length').textContent = `Original length: ${json.metadata['©ART'].length} bytes`;
-        } else {
-          metaArtist.value = 'akila';
-          document.getElementById('meta-artist-length').textContent = 'No original metadata found';
-        }
-        
-        if (json.metadata['©cpy']) {
-          metaCopyright.value = json.metadata['©cpy'].value;
-          document.getElementById('meta-copyright-length').textContent = `Original length: ${json.metadata['©cpy'].length} bytes`;
-        } else {
-          metaCopyright.value = 'akila';
-          document.getElementById('meta-copyright-length').textContent = 'No original metadata found';
-        }
-        
-        if (json.metadata['©cmt']) {
-          metaComment.value = json.metadata['©cmt'].value;
-          document.getElementById('meta-comment-length').textContent = `Original length: ${json.metadata['©cmt'].length} bytes`;
-        } else {
-          metaComment.value = '@akila';
-          document.getElementById('meta-comment-length').textContent = 'No original metadata found';
-        }
-      } else {
-        document.getElementById('meta-artist-length').textContent = 'No original metadata found';
-        document.getElementById('meta-copyright-length').textContent = 'No original metadata found';
-        document.getElementById('meta-comment-length').textContent = 'No original metadata found';
-      }
-    } catch (e) {
-      console.error('Metadata extraction failed:', e);
-      document.getElementById('meta-artist-length').textContent = 'Extraction failed';
-      document.getElementById('meta-copyright-length').textContent = 'Extraction failed';
-      document.getElementById('meta-comment-length').textContent = 'Extraction failed';
-    }
+    runBtn.disabled = false;
   }
 
   // ── Colorise log lines ──
@@ -487,12 +398,9 @@
     indicator.className = 'log-header running';
     runBtn.disabled = true;
 
-    // Upload with metadata
+    // Upload
     const fd = new FormData();
     fd.append('file', selectedFile);
-    fd.append('artist', metaArtist.value);
-    fd.append('copyright', metaCopyright.value);
-    fd.append('comment', metaComment.value);
     appendLog(`[JOB] uploading ${selectedFile.name}…`);
 
     let jobId;
