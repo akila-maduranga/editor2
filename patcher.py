@@ -213,7 +213,6 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
         "-map_metadata", "-1",
         "-brand", "isom",
         "-video_track_timescale", "90000",
-        "-movflags", "+faststart",
         "-bitexact",
         "-metadata", "encoder=Lavf60.16.100",
     ]
