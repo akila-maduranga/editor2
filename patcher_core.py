@@ -371,16 +371,16 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     stem = input_path.stem
     suffix = input_path.suffix
 
-    # ---- 1. Remux to Non-Faststart via ffmpeg -movflags -faststart ----
+    # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux (Non-Faststart, strip metadata) ─────────────────────")
+        log_func("── 1/7  Remux (Faststart, normalize layout) ──────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-c", "copy",
-        "-movflags", "-faststart",
+        "-movflags", "+faststart",
         str(clean),
     ]
     if log_func:
@@ -405,15 +405,15 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func("[LAYOUT] After ffmpeg remux:")
         _dump_atoms(data, "REMUX", log_func)
         md = data.find(b'mdat')
-        mv = data.rfind(b'moov')
-        log_func(f"[CHECK] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
+        mv = data.find(b'moov')
+        log_func(f"[CHECK] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
 
-    # ---- 3. Insert free atom after ftyp (if not already present) ----
+    # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
     if log_func:
         log_func("")
         log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
-    # Check what atom follows ftyp — ffmpeg may already have placed a free atom
+    # Check whether ffmpeg already placed a free atom after ftyp
     next_type = data[ftyp_size+4:ftyp_size+8]
     if next_type == b'free':
         if log_func:
@@ -443,8 +443,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    # Non-Faststart: free atom(s) shift mdat; moov is after mdat
-    patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=True, moov_before_mdat=False)
+    # Faststart: free atom shifts moov+mdat; moov is before mdat
+    patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=True, moov_before_mdat=True)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed")
@@ -481,8 +481,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func("── Atom layout ────────────────────────────────────────────────────")
         _dump_atoms(data, "FINAL", log_func)
         md = data.find(b'mdat')
-        mv = data.rfind(b'moov')
-        log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
+        mv = data.find(b'moov')
+        log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
 
     # ---- 10. Write final output ----
     output_path.write_bytes(bytes(data))
