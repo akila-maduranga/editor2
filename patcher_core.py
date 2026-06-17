@@ -14,6 +14,8 @@ All 7 target patches:
 
 import struct
 import subprocess
+import time
+import random
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent
@@ -362,7 +364,7 @@ def relocate_to_non_faststart(data, log_func=None):
     return data
 
 
-def patch_all(input_path, output_path, comment="@akila", log_func=None):
+def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[JOB] starting patch pipeline")
 
@@ -371,16 +373,22 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     stem = input_path.stem
     suffix = input_path.suffix
 
+    if comment is None or comment == "@akila":
+        ts = int(time.time())
+        tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
+        comment = f"Patched by method.akila - {tag}"
+
     # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
     if log_func:
         log_func("")
-        log_func("── 1/7  Remux (Faststart, normalize layout) ──────────────────────")
+        log_func("── 1/8  Remux (Faststart, normalize layout) ──────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-c", "copy",
         "-movflags", "+faststart",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
         str(clean),
     ]
     if log_func:
@@ -411,7 +419,7 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
     if log_func:
         log_func("")
-        log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
+        log_func("── 2/8  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
     # Check whether ffmpeg already placed a free atom after ftyp
     next_type = data[ftyp_size+4:ftyp_size+8]
@@ -428,19 +436,19 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     # ---- 4. Date zeroing ----
     if log_func:
         log_func("")
-        log_func("── 3/7  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
+        log_func("── 3/8  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
     data = patch_timestamps(data)
 
     # ---- 5. Language spoofing -> und ----
     if log_func:
         log_func("")
-        log_func("── 4/7  Language spoofing -> 'und' ────────────────────────────")
+        log_func("── 4/8  Language spoofing -> 'und' ────────────────────────────")
     data = patch_language(data)
 
     # ---- 6. Frame count inflation (10x) ----
     if log_func:
         log_func("")
-        log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
+        log_func(f"── 5/8  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
     # Faststart: free atom shifts moov+mdat; moov is before mdat
@@ -456,7 +464,7 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     # ---- 7. Inject metadata (ilst) at end of moov ----
     if log_func:
         log_func("")
-        log_func("── 6/7  Inject metadata (ilst box) ─────────────────────────────")
+        log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
     moov_idx = data.rfind(b'moov')
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
@@ -469,15 +477,39 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}")
 
-    # ---- 8. Fake trailer atom ----
+    # ---- 8. Expand ffmpeg's free(8) to hit target media_data_offset ----
     if log_func:
         log_func("")
-        log_func("── 7/7  Fake trailer atom ───────────────────────────────────────")
+        log_func("── 7/8  Expand padding to target media_data_offset=237436 ──────")
+    moov_end = moov_start + new_size
+    # Check ffmpeg's free(8) is right after moov
+    if data[moov_end:moov_end+8] != b'\x00\x00\x00\x08free':
+        if log_func:
+            log_func("[PADDING] expected free(8) after moov not found — skipping")
+    else:
+        target_offset = 237436
+        # mdat_data_offset = 48 + moov_size + free_size
+        needed_free_size = target_offset - 48 - new_size
+        if needed_free_size <= 8:
+            if log_func:
+                log_func(f"[PADDING] offset already >= {target_offset} — no change needed")
+        else:
+            extra = needed_free_size - 8
+            new_free = struct.pack('>I4s', needed_free_size, b'free')
+            data[moov_end:moov_end+8] = new_free + b'\x00' * extra
+            _adjust_stco(data, extra, moov_start, moov_start + new_size)
+            if log_func:
+                log_func(f"[PADDING] free(8) -> free({needed_free_size})  (+{extra} bytes)")
+
+    # ---- 9. Fake trailer atom ----
+    if log_func:
+        log_func("")
+        log_func("── 8/8  Fake trailer atom ───────────────────────────────────────")
     data += b'\x00\x00\x00\x04junk'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
-    # ---- 9. Final verify ----
+    # ---- 10. Final verify ----
     if log_func:
         log_func("")
         log_func("── Atom layout ────────────────────────────────────────────────────")
@@ -486,7 +518,7 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         mv = data.find(b'moov')
         log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
 
-    # ---- 10. Write final output ----
+    # ---- 11. Write final output ----
     output_path.write_bytes(bytes(data))
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
