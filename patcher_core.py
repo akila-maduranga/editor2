@@ -172,12 +172,30 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     if custom_tag:
         entries[b'\xa9cmt'] = custom_tag
 
-    # Build as direct children of udta (Windows-compatible, no meta/ilst wrapper)
+    # Build as direct children of udta (Windows-compatible)
     udta_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')
+        # Direct: size + type + value (Windows reads this)
         tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
         udta_data += tag_box
+
+    # Also add Apple-style meta/ilst/data wrapper for compatibility
+    ilst_data = b''
+    for tag_key, value in entries.items():
+        value_bytes = value.encode('utf-8')
+        data_atom = struct.pack('>I4sII', 16 + len(value_bytes), b'data', 1, 0)
+        data_atom += value_bytes
+        ilst_entry = struct.pack('>I4s', 8 + len(data_atom), tag_key) + data_atom
+        ilst_data += ilst_entry
+
+    ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
+    hdlr = struct.pack('>I4sI', 32, b'hdlr', 0)
+    hdlr += struct.pack('>I4s', 0, b'mdta')
+    hdlr += struct.pack('>III', 0, 0, 0)
+    meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
+    meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
+    udta_data += meta
 
     return struct.pack('>I4s', 8 + len(udta_data), b'udta') + udta_data
 
