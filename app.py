@@ -59,34 +59,37 @@ def find_box(data: bytes, box_type: bytes, start: int = 0, end: int | None = Non
 
 
 def _adjust_chunk_offsets(data: bytes, delta: int) -> bytes:
-    """Add delta to every chunk offset in stco/co64 boxes after moov expansion."""
+    """Add delta to every chunk offset in stco/co64 boxes (recursive scan)."""
     if delta == 0:
         return data
     p = bytearray(data)
-    i = 0
-    while i + 8 <= len(p):
-        size = struct.unpack(">I", p[i:i+4])[0]
-        btype = p[i+4:i+8]
-        if size == 0:
-            size = len(p) - i
-        if size < 8:
-            break
-        if btype in (b"stco", b"co64"):
-            entry_count = struct.unpack(">I", p[i+12:i+16])[0]
-            if entry_count > 200000:
+    CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+
+    def _dfs(start: int, end: int):
+        i = start
+        while i + 8 <= min(end, len(p)):
+            size = struct.unpack(">I", p[i:i+4])[0]
+            btype = p[i+4:i+8]
+            if size == 0:
+                size = end - i
+            if size < 8:
                 break
-            entry_size = 4 if btype == b"stco" else 8
-            for j in range(entry_count):
-                off = i + 16 + j * entry_size
-                if off + entry_size > len(p):
-                    break
-                if entry_size == 4:
-                    val = struct.unpack(">I", p[off:off+4])[0]
-                    struct.pack_into(">I", p, off, val + delta)
-                else:
-                    val = struct.unpack(">Q", p[off:off+8])[0]
-                    struct.pack_into(">Q", p, off, val + delta)
-        i += size
+            if btype in (b"stco", b"co64"):
+                entry_count = struct.unpack(">I", p[i+12:i+16])[0]
+                if entry_count > 200000:
+                    return
+                entry_size = 4 if btype == b"stco" else 8
+                for j in range(entry_count):
+                    off = i + 16 + j * entry_size
+                    if off + entry_size > len(p):
+                        break
+                    val = struct.unpack(">I" if entry_size == 4 else ">Q", p[off:off+entry_size])[0]
+                    struct.pack_into(">I" if entry_size == 4 else ">Q", p, off, val + delta)
+            elif btype in CONTAINERS:
+                _dfs(i + 8, i + size)
+            i += size
+
+    _dfs(0, len(p))
     return bytes(p)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +108,10 @@ def patch_ftyp(data: bytes, log: queue.Queue) -> bytes:
     body     = FTYP_MAJOR + FTYP_MINOR + FTYP_COMPAT
     new_ftyp = struct.pack(">I", 8+len(body)) + b"ftyp" + body
     _log(log, f"[PATCH] ftyp  major={old!r} → isom  minor → 0x00000200")
-    return data[:off] + new_ftyp + data[off+sz:]
+    result = data[:off] + new_ftyp + data[off+sz:]
+    if len(new_ftyp) != sz:
+        result = _adjust_chunk_offsets(result, len(new_ftyp) - sz)
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch 2 — timestamp zeroing (mvhd / tkhd / mdhd)
