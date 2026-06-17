@@ -464,6 +464,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     data[moov_end:moov_end] = md_tree
     new_size = current_size + md_growth
     data[moov_start:moov_start+4] = new_size.to_bytes(4, 'big')
+    # Moov grew by md_growth, which shifts mdat right — adjust stco accordingly
+    _adjust_stco(data, md_growth, moov_start, moov_start + new_size)
     if log_func:
         log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}")
 
