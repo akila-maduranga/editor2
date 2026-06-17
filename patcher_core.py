@@ -283,6 +283,7 @@ def remux(input_path, output_path, comment, log_func=None):
         "-c", "copy",
         "-brand", "isom",
         "-video_track_timescale", "90000",
+        "-movflags", "+faststart",
         "-bitexact",
         "-map_metadata", "-1",
         "-metadata", "encoder=Lavf60.16.100",
@@ -305,6 +306,77 @@ def remux(input_path, output_path, comment, log_func=None):
     if log_func:
         log_func("[REMUX] done")
     return True
+
+
+def stbl_list(atoms, result, path=""):
+    for atom in atoms:
+        cur = f"{path}/{atom['name'].decode('latin1')}"
+        if atom['name'] in (b'stco', b'co64'):
+            d = atom['data']
+            entry_size = 8 if atom['name'] == b'co64' else 4
+            n = int.from_bytes(d[4:8], 'big')
+            off = atom['start'] + 8 + 8  # atom header (8) + version/flags (4) + count (4)
+            vals = []
+            for i in range(n):
+                vals.append(d[8+i*entry_size:8+i*entry_size+entry_size])
+            result.append((cur, off - atom['start'], vals))
+        if 'children' in atom:
+            stbl_list(atom['children'], result, cur)
+
+
+def _move_moov_to_end(data):
+    pos = 0
+    moov_start = moov_size = -1
+    while pos + 8 <= len(data):
+        box_size = struct.unpack(">I", data[pos:pos+4])[0]
+        box_type = data[pos+4:pos+8]
+        header_size = 8
+        if box_size == 0:
+            # extends to end of file, must be last box
+            box_size = len(data) - pos
+        elif box_size == 1:
+            # 64-bit extended size
+            if pos + 16 > len(data):
+                break
+            box_size = struct.unpack(">Q", data[pos+8:pos+16])[0]
+            header_size = 16
+        if box_size < header_size:
+            break
+        if box_type == b'moov':
+            moov_start = pos
+            moov_size = box_size
+            break
+        pos += box_size
+
+    if moov_start < 0 or moov_size < 0:
+        return data
+
+    # Move moov to end
+    moov_end = moov_start + moov_size
+    before = data[:moov_start]
+    after = data[moov_end:]
+    new_moov_start = len(before) + len(after)
+    new_data = bytearray(before + after + data[moov_start:moov_end])
+
+    # Adjust stco/co64 offsets inside the relocated moov
+    from binascii import hexlify
+    tree, _ = read_atoms_in_range(new_data, new_moov_start + 8, new_moov_start + moov_size)
+    stco_name_order = []
+    stbl_list(tree, stco_name_order)
+    for path, coff_off, integer_offsets in stco_name_order:
+        stco_start = new_moov_start + 8 + coff_off
+        for i in range(len(integer_offsets)):
+            off_bytes = integer_offsets[i]
+            old_val = 0
+            if len(off_bytes) == 4:
+                old_val = struct.unpack(">I", off_bytes)[0]
+                new_val = old_val - moov_size
+                new_data[stco_start + i*4:stco_start + i*4+4] = struct.pack(">I", new_val)
+            else:
+                old_val = struct.unpack(">Q", off_bytes)[0]
+                new_val = old_val - moov_size
+                new_data[stco_start + i*8:stco_start + i*8+8] = struct.pack(">Q", new_val)
+    return bytes(new_data)
 
 
 def patch_all(input_path, output_path, comment="@akila", log_func=None):
@@ -354,8 +426,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    pre_shift = 8
-    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True, moov_before_mdat=False)
+    pre_shift = 8 + md_growth
+    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True, moov_before_mdat=True)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed (moov/trak/stsz not found)")
@@ -385,8 +457,11 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
+    # ---- Relocate moov to end (Non-Faststart) ----
+    data = _move_moov_to_end(bytes(data))
+
     # ---- Write output ----
-    output_path.write_bytes(bytes(data))
+    output_path.write_bytes(data)
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
         log_func("")
