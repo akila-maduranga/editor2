@@ -63,13 +63,13 @@ def _adjust_chunk_offsets(data: bytes, delta: int) -> bytes:
     if delta == 0:
         return data
     p = bytearray(data)
-    CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+    CONTAINERS = (b"moov", b"trak", b"mdia", b"minf", b"stbl")
 
     def _dfs(start: int, end: int):
         i = start
         while i + 8 <= min(end, len(p)):
             size = struct.unpack(">I", p[i:i+4])[0]
-            btype = p[i+4:i+8]
+            btype = bytes(p[i+4:i+8])
             if size == 0:
                 size = end - i
             if size < 8:
