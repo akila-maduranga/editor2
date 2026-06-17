@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TikTok MP4 Patcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0A0A0C;
+    --surface:   #111115;
+    --border:    #1E1E26;
+    --border-hi: #2E2E3E;
+    --cyan:      #00E5FF;
+    --cyan-dim:  #00AABF;
+    --cyan-glow: rgba(0,229,255,0.12);
+    --red:       #FF4154;
+    --green:     #39FF8E;
+    --yellow:    #FFD166;
+    --muted:     #6B6B7A;
+    --text:      #C8C8D4;
+    --text-hi:   #EEEEF6;
+    --mono:      'JetBrains Mono', 'Courier New', monospace;
+  }
+
+  html { font-size: 14px; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* ── Header ── */
+  header {
+    width: 100%;
+    max-width: 860px;
+    padding: 48px 24px 0;
+  }
+  .wordmark {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .wordmark-tag {
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--border-hi);
+    padding: 2px 6px;
+    border-radius: 2px;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-hi);
+    letter-spacing: -0.02em;
+  }
+  h1 span { color: var(--cyan); }
+  .subtitle {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-top: 4px;
+    line-height: 1.6;
+    max-width: 540px;
+  }
+
+  /* ── Divider ── */
+  .rule {
+    width: 100%;
+    max-width: 860px;
+    height: 1px;
+    background: var(--border);
+    margin: 28px 24px;
+  }
+
+  /* ── Main layout ── */
+  main {
+    width: 100%;
+    max-width: 860px;
+    padding: 0 24px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* ── Drop zone ── */
+  #drop-zone {
+    border: 1.5px dashed var(--border-hi);
+    border-radius: 6px;
+    padding: 52px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    position: relative;
+    outline: none;
+  }
+  #drop-zone:hover, #drop-zone.drag-over {
+    border-color: var(--cyan-dim);
+    background: var(--cyan-glow);
+  }
+  #drop-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .drop-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+    color: var(--muted);
+  }
+  .drop-label {
+    font-size: 13px;
+    color: var(--text-hi);
+    font-weight: 500;
+  }
+  .drop-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+  #file-name {
+    margin-top: 14px;
+    font-size: 11.5px;
+    color: var(--cyan);
+    min-height: 18px;
+  }
+
+  /* ── Pipeline info ── */
+  .pipeline {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .step {
+    flex: 1;
+    padding: 14px 18px;
+    border-right: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .step:last-child { border-right: none; }
+  .step-num {
+    color: var(--cyan);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+  .step-title { color: var(--text-hi); font-weight: 500; margin-bottom: 2px; }
+  .step-desc { color: var(--muted); line-height: 1.5; }
+
+  /* ── Run button ── */
+  #run-btn {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--cyan);
+    color: #000;
+    border: none;
+    border-radius: 4px;
+    padding: 14px 32px;
+    cursor: pointer;
+    transition: background 0.12s, opacity 0.12s;
+    align-self: flex-start;
+  }
+  #run-btn:hover:not(:disabled) { background: #33EDFF; }
+  #run-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  /* ── Terminal log ── */
+  #log-section { display: none; flex-direction: column; gap: 10px; }
+  .log-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .log-header::before {
+    content: '';
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex-shrink: 0;
+  }
+  .log-header.running::before { background: var(--cyan); animation: pulse 1s infinite; }
+  .log-header.done::before    { background: var(--green); animation: none; }
+  .log-header.error::before   { background: var(--red); animation: none; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  #terminal {
+    background: #070709;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 18px 20px;
+    height: 340px;
+    overflow-y: auto;
+    font-size: 11.5px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text);
+  }
+  #terminal::-webkit-scrollbar { width: 4px; }
+  #terminal::-webkit-scrollbar-track { background: transparent; }
+  #terminal::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 4px; }
+
+  .log-remux  { color: var(--cyan-dim); }
+  .log-patch  { color: #A78BFF; }
+  .log-ffmpeg { color: var(--muted); font-size: 10.5px; }
+  .log-done   { color: var(--green); font-weight: 700; }
+  .log-error  { color: var(--red); }
+  .log-warn   { color: var(--yellow); }
+  .log-job    { color: var(--text-hi); }
+  .log-sep    { color: var(--border-hi); }
+
+  /* ── Download ── */
+  #download-section { display: none; }
+  #download-btn {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+    background: transparent;
+    color: var(--green);
+    border: 1.5px solid var(--green);
+    border-radius: 4px;
+    padding: 12px 28px;
+    cursor: pointer;
+    letter-spacing: 0.04em;
+    transition: background 0.12s, color 0.12s;
+    text-decoration: none;
+    display: inline-block;
+  }
+  #download-btn:hover { background: var(--green); color: #000; }
+
+  /* ── Footer ── */
+  footer {
+    margin-top: auto;
+    padding: 24px;
+    font-size: 10.5px;
+    color: var(--muted);
+    text-align: center;
+    border-top: 1px solid var(--border);
+    width: 100%;
+  }
+  footer a { color: var(--muted); text-decoration: underline dotted; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">
+    <h1>tiktok<span>patcher</span></h1>
+    <span class="wordmark-tag">self-hosted</span>
+  </div>
+  <p class="subtitle">
+    Remuxes MP4 files via ffmpeg stream-copy (+faststart) and applies
+    a binary structural patch — rewriting <code>ftyp</code> brand and clearing
+    <code>mvhd</code> random-access flags — to bypass TikTok's re-upload compression.
+  </p>
+</header>
+
+<div class="rule"></div>
+
+<main>
+
+  <!-- Drop zone -->
+  <div id="drop-zone" tabindex="0" role="button" aria-label="Upload MP4 file">
+    <input type="file" id="file-input" accept=".mp4,video/mp4">
+    <div class="drop-icon">▤</div>
+    <div class="drop-label">Drop your MP4 here, or click to browse</div>
+    <div class="drop-sub">Only .mp4 files — processed entirely on this server</div>
+    <div id="file-name"></div>
+  </div>
+
+  <!-- Pipeline steps -->
+  <div class="pipeline">
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-title">Stream Remux</div>
+      <div class="step-desc">ffmpeg stream copy, no re-encoding. moov atom moved to front (+faststart).</div>
+    </div>
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-title">ftyp Patch</div>
+      <div class="step-desc">Rewrites major brand to <code>mp42</code> with canonical compatible brands list.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-title">mvhd Flag Clear</div>
+      <div class="step-desc">Clears the random-access flag bit in the movie header box.</div>
+    </div>
+  </div>
+
+  <!-- Run -->
+  <button id="run-btn" disabled>▶ Patch Video</button>
+
+  <!-- Terminal log -->
+  <div id="log-section">
+    <div class="log-header" id="log-status-indicator">Processing…</div>
+    <div id="terminal"></div>
+  </div>
+
+  <!-- Download -->
+  <div id="download-section">
+    <a id="download-btn" href="#" download>↓ Download Patched MP4</a>
+  </div>
+
+</main>
+
+<footer>
+  Runs entirely on your VPS — no third-party uploads.
+  ffmpeg must be installed (<code>apt install ffmpeg</code>).
+</footer>
+
+<script>
+  const dropZone   = document.getElementById('drop-zone');
+  const fileInput  = document.getElementById('file-input');
+  const fileName   = document.getElementById('file-name');
+  const runBtn     = document.getElementById('run-btn');
+  const logSection = document.getElementById('log-section');
+  const terminal   = document.getElementById('terminal');
+  const indicator  = document.getElementById('log-status-indicator');
+  const dlSection  = document.getElementById('download-section');
+  const dlBtn      = document.getElementById('download-btn');
+
+  let selectedFile = null;
+
+  // ── Drag & drop ──
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+  fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+  function handleFile(f) {
+    if (!f.name.toLowerCase().endsWith('.mp4')) {
+      fileName.textContent = '✗ Only .mp4 files accepted';
+      fileName.style.color = 'var(--red)';
+      runBtn.disabled = true;
+      return;
+    }
+    selectedFile = f;
+    const mb = (f.size / 1048576).toFixed(1);
+    fileName.textContent = `✓ ${f.name}  (${mb} MB)`;
+    fileName.style.color = 'var(--cyan)';
+    runBtn.disabled = false;
+  }
+
+  // ── Colorise log lines ──
+  function colorClass(line) {
+    if (line.startsWith('[REMUX]'))  return 'log-remux';
+    if (line.startsWith('[PATCH]'))  return 'log-patch';
+    if (line.startsWith('[ffmpeg]')) return 'log-ffmpeg';
+    if (line.startsWith('[DONE]'))   return 'log-done';
+    if (line.startsWith('[ERROR]'))  return 'log-error';
+    if (line.startsWith('[WARN]'))   return 'log-warn';
+    if (line.startsWith('[JOB]'))    return 'log-job';
+    if (line.startsWith('──'))       return 'log-sep';
+    return '';
+  }
+
+  function appendLog(text) {
+    const span = document.createElement('span');
+    const cls  = colorClass(text);
+    if (cls) span.className = cls;
+    span.textContent = text + '\n';
+    terminal.appendChild(span);
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  // ── Run ──
+  runBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+
+    // Reset UI
+    terminal.innerHTML = '';
+    dlSection.style.display = 'none';
+    logSection.style.display = 'flex';
+    indicator.textContent = 'Processing…';
+    indicator.className = 'log-header running';
+    runBtn.disabled = true;
+
+    // Upload
+    const fd = new FormData();
+    fd.append('file', selectedFile);
+    appendLog(`[JOB] uploading ${selectedFile.name}…`);
+
+    let jobId;
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const json = await res.json();
+      if (json.error) { appendLog(`[ERROR] ${json.error}`); return; }
+      jobId = json.job_id;
+    } catch(e) {
+      appendLog(`[ERROR] Upload failed: ${e}`);
+      indicator.className = 'log-header error';
+      indicator.textContent = 'Upload failed';
+      return;
+    }
+
+    appendLog(`[JOB] job ${jobId.slice(0,8)}… accepted`);
+
+    // Stream logs via SSE
+    const evtSrc = new EventSource(`/stream/${jobId}`);
+    evtSrc.onmessage = e => {
+      const data = e.data;
+      if (data.startsWith('__STATUS__')) {
+        evtSrc.close();
+        const [status, outFile] = data.slice(10).split('|');
+        if (status === 'done') {
+          indicator.className = 'log-header done';
+          indicator.textContent = 'Complete';
+          dlBtn.href = `/download/${outFile}`;
+          dlBtn.download = outFile.replace(/^[^_]+_[^_]+_/, '');  // strip job prefix
+          dlSection.style.display = 'block';
+        } else {
+          indicator.className = 'log-header error';
+          indicator.textContent = 'Error — see log above';
+        }
+        runBtn.disabled = false;
+      } else {
+        appendLog(data);
+      }
+    };
+    evtSrc.onerror = () => {
+      evtSrc.close();
+      appendLog('[ERROR] Lost connection to server');
+      indicator.className = 'log-header error';
+      indicator.textContent = 'Connection lost';
+      runBtn.disabled = false;
+    };
+  });
+</script>
+</body>
+</html>
