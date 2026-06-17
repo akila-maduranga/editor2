@@ -172,21 +172,14 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     if custom_tag:
         entries[b'\xa9cmt'] = custom_tag
 
-    ilst_data = b''
+    # Build as direct children of udta (Windows-compatible, no meta/ilst wrapper)
+    udta_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')
-        data_atom = struct.pack('>I4sII', 16 + len(value_bytes), b'data', 1, 0)
-        data_atom += value_bytes
-        ilst_entry = struct.pack('>I4s', 8 + len(data_atom), tag_key) + data_atom
-        ilst_data += ilst_entry
+        tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
+        udta_data += tag_box
 
-    ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
-    hdlr = struct.pack('>I4sI', 32, b'hdlr', 0)
-    hdlr += struct.pack('>I4s', 0, b'mdta')
-    hdlr += struct.pack('>III', 0, 0, 0)
-    meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
-    meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
-    return struct.pack('>I4s', 8 + len(meta), b'udta') + meta
+    return struct.pack('>I4s', 8 + len(udta_data), b'udta') + udta_data
 
 
 def _zero_timestamps(data, off):
