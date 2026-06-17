@@ -461,7 +461,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         return False
     data = bytearray(patched)
 
-    # ---- 7. Inject metadata (ilst) at end of moov ----
+    # ---- 7. Inject metadata (ilst) — replace existing udta or append ----
     if log_func:
         log_func("")
         log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
@@ -469,13 +469,34 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
     moov_end = moov_start + current_size
+
+    # Search for existing udta inside moov and remove it
+    pos = moov_start + 8
+    udta_removed = 0
+    while pos + 8 <= moov_end:
+        atom_size = int.from_bytes(data[pos:pos+4], 'big')
+        atom_type = data[pos+4:pos+8]
+        if atom_size < 8:
+            break
+        if atom_type == b'udta':
+            del data[pos:pos + atom_size]
+            udta_removed = atom_size
+            current_size -= udta_removed
+            moov_end -= udta_removed
+            break
+        pos += atom_size
+
+    # Append metadata tree (starts with udta) at end of moov
     data[moov_end:moov_end] = md_tree
     new_size = current_size + md_growth
     data[moov_start:moov_start+4] = new_size.to_bytes(4, 'big')
-    # Moov grew by md_growth, which shifts mdat right — adjust stco accordingly
-    _adjust_stco(data, md_growth, moov_start, moov_start + new_size)
+    # Adjust stco for the net shift in moov size (md_growth - udta_removed)
+    net_shift = md_growth - udta_removed
+    if net_shift != 0:
+        _adjust_stco(data, net_shift, moov_start, moov_start + new_size)
     if log_func:
-        log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}")
+        log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}"
+                 f"  (removed udta={udta_removed}, added={md_growth}, net={net_shift:+d})")
 
     # ---- 8. Expand ffmpeg's free(8) to hit target media_data_offset ----
     if log_func:
