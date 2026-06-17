@@ -402,18 +402,28 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     data = clean.read_bytes()
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
+        log_func("[LAYOUT] After ffmpeg remux:")
+        _dump_atoms(data, "REMUX", log_func)
         md = data.find(b'mdat')
         mv = data.rfind(b'moov')
         log_func(f"[CHECK] mdat at {md}, moov at {mv}, moov at end: {'YES' if mv > md else 'NO'}")
 
-    # ---- 3. Insert free atom after ftyp ----
+    # ---- 3. Insert free atom after ftyp (if not already present) ----
     if log_func:
         log_func("")
         log_func("── 2/7  Insert free atom after ftyp ───────────────────────────")
     ftyp_size = int.from_bytes(data[0:4], 'big')
-    data = data[:ftyp_size] + b'\x00\x00\x00\x08free' + data[ftyp_size:]
-    if log_func:
-        log_func("[PATCH] free atom inserted (size=8)")
+    # Check what atom follows ftyp — ffmpeg may already have placed a free atom
+    next_type = data[ftyp_size+4:ftyp_size+8]
+    if next_type == b'free':
+        if log_func:
+            log_func("[PATCH] free atom already present after ftyp — skipping insertion")
+        pre_shift_extra = 0
+    else:
+        data = data[:ftyp_size] + b'\x00\x00\x00\x08free' + data[ftyp_size:]
+        if log_func:
+            log_func("[PATCH] free atom inserted (size=8)")
+        pre_shift_extra = 8
 
     # ---- 4. Date zeroing ----
     if log_func:
@@ -433,8 +443,8 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    # Non-Faststart: free(8) shifts mdat; moov is after mdat
-    patched = inject_fake_frames(data, pre_shift=8, stts_overflow=True, moov_before_mdat=False)
+    # Non-Faststart: free atom(s) shift mdat; moov is after mdat
+    patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=True, moov_before_mdat=False)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed")
