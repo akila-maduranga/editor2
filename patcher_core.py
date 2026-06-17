@@ -233,8 +233,9 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100", 
         if original_metadata and tag_key in original_metadata:
             orig_len = original_metadata[tag_key]['length']
             if len(value_bytes) < orig_len:
-                # Pad with null bytes to match exact original length
-                value_bytes = value_bytes + b'\x00' * (orig_len - len(value_bytes))
+                # Pad with spaces (not null bytes) to match exact original length
+                # Null bytes can cause playback issues in some players
+                value_bytes = value_bytes + b' ' * (orig_len - len(value_bytes))
             elif len(value_bytes) > orig_len:
                 # Truncate if longer (should not happen in normal use)
                 value_bytes = value_bytes[:orig_len]

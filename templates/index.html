@@ -396,8 +396,17 @@
     const mb = (f.size / 1048576).toFixed(1);
     fileName.textContent = `✓ ${f.name}  (${mb} MB)`;
     fileName.style.color = 'var(--cyan)';
+    runBtn.disabled = false; // Enable button immediately
     
-    // Extract metadata
+    // Extract metadata asynchronously (non-blocking)
+    metaSection.style.display = 'block';
+    metaArtist.value = 'akila';
+    metaCopyright.value = 'akila';
+    metaComment.value = '@akila';
+    document.getElementById('meta-artist-length').textContent = 'Loading...';
+    document.getElementById('meta-copyright-length').textContent = 'Loading...';
+    document.getElementById('meta-comment-length').textContent = 'Loading...';
+    
     try {
       const fd = new FormData();
       fd.append('file', f);
@@ -406,7 +415,6 @@
       
       if (json.metadata) {
         originalMetadata = json.metadata;
-        metaSection.style.display = 'block';
         
         // Populate fields
         if (json.metadata['©ART']) {
@@ -433,23 +441,16 @@
           document.getElementById('meta-comment-length').textContent = 'No original metadata found';
         }
       } else {
-        metaSection.style.display = 'block';
-        metaArtist.value = 'akila';
-        metaCopyright.value = 'akila';
-        metaComment.value = '@akila';
         document.getElementById('meta-artist-length').textContent = 'No original metadata found';
         document.getElementById('meta-copyright-length').textContent = 'No original metadata found';
         document.getElementById('meta-comment-length').textContent = 'No original metadata found';
       }
     } catch (e) {
       console.error('Metadata extraction failed:', e);
-      metaSection.style.display = 'block';
-      metaArtist.value = 'akila';
-      metaCopyright.value = 'akila';
-      metaComment.value = '@akila';
+      document.getElementById('meta-artist-length').textContent = 'Extraction failed';
+      document.getElementById('meta-copyright-length').textContent = 'Extraction failed';
+      document.getElementById('meta-comment-length').textContent = 'Extraction failed';
     }
-    
-    runBtn.disabled = false;
   }
 
   // ── Colorise log lines ──
