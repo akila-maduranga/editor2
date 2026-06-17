@@ -283,7 +283,6 @@ def remux(input_path, output_path, comment, log_func=None):
         "-c", "copy",
         "-brand", "isom",
         "-video_track_timescale", "90000",
-        "-movflags", "+faststart",
         "-bitexact",
         "-map_metadata", "-1",
         "-metadata", "encoder=Lavf60.16.100",
@@ -308,42 +307,51 @@ def remux(input_path, output_path, comment, log_func=None):
     return True
 
 
-def stbl_list(atoms, result):
-    for atom in atoms:
-        if atom['name'] in (b'stco', b'co64'):
-            d = atom['data']
-            entry_size = 8 if atom['name'] == b'co64' else 4
-            n = int.from_bytes(d[4:8], 'big')
-            data_start_off = atom['start'] + 16
-            vals = []
-            for i in range(n):
-                vals.append(d[8+i*entry_size:8+i*entry_size+entry_size])
-            result.append((data_start_off, vals, entry_size))
-        if 'children' in atom:
-            stbl_list(atom['children'], result)
+def _detect_layout(data):
+    pos = 0
+    moov_off = mdat_off = -1
+    while pos + 8 <= len(data):
+        sz = struct.unpack(">I", data[pos:pos+4])[0]
+        bt = data[pos+4:pos+8]
+        if sz == 0:
+            sz = len(data) - pos
+        elif sz == 1:
+            if pos + 16 > len(data):
+                break
+            sz = struct.unpack(">Q", data[pos+8:pos+16])[0]
+        if bt == b'moov':
+            moov_off = pos
+        elif bt == b'mdat':
+            mdat_off = pos
+        if moov_off >= 0 and mdat_off >= 0:
+            break
+        if sz < 8:
+            break
+        pos += sz
+    if moov_off < 0 or mdat_off < 0:
+        return 'faststart'
+    return 'faststart' if moov_off < mdat_off else 'non_faststart'
 
 
 def _move_moov_to_end(data):
     pos = 0
     moov_start = moov_size = -1
     while pos + 8 <= len(data):
-        box_size = struct.unpack(">I", data[pos:pos+4])[0]
-        box_type = data[pos+4:pos+8]
-        header_size = 8
-        if box_size == 0:
-            box_size = len(data) - pos
-        elif box_size == 1:
+        size = struct.unpack(">I", data[pos:pos+4])[0]
+        btype = data[pos+4:pos+8]
+        if size == 0:
+            size = len(data) - pos
+        elif size == 1:
             if pos + 16 > len(data):
                 break
-            box_size = struct.unpack(">Q", data[pos+8:pos+16])[0]
-            header_size = 16
-        if box_size < header_size:
+            size = struct.unpack(">Q", data[pos+8:pos+16])[0]
+        if size < 8:
             break
-        if box_type == b'moov':
+        if btype == b'moov':
             moov_start = pos
-            moov_size = box_size
+            moov_size = size
             break
-        pos += box_size
+        pos += size
 
     if moov_start < 0 or moov_size < 0:
         return data
@@ -354,19 +362,40 @@ def _move_moov_to_end(data):
     new_data = bytearray(before + after + data[moov_start:moov_end])
     new_moov_off = len(before) + len(after)
 
-    tree, _ = read_atoms_in_range(new_data, new_moov_off + 8, new_moov_off + moov_size)
-    stco_info = []
-    stbl_list(tree, stco_info)
-    for off, vals, esize in stco_info:
-        for i, bval in enumerate(vals):
-            if esize == 4:
-                old_val = struct.unpack(">I", bval)[0]
-                new_val = old_val - moov_size
-                new_data[off + i*4:off + i*4+4] = struct.pack(">I", new_val)
-            else:
-                old_val = struct.unpack(">Q", bval)[0]
-                new_val = old_val - moov_size
-                new_data[off + i*8:off + i*8+8] = struct.pack(">Q", new_val)
+    def fix_boxes(buf, start, end):
+        p = start
+        while p + 8 <= end:
+            size = struct.unpack(">I", bytes(buf[p:p+4]))[0]
+            btype = bytes(buf[p+4:p+8])
+            hdr = 8
+            if size == 0:
+                size = end - p
+            elif size == 1:
+                if p + 16 > end:
+                    break
+                size = struct.unpack(">Q", bytes(buf[p+8:p+16]))[0]
+                hdr = 16
+            if size < hdr:
+                p += 1
+                continue
+            if btype == b'stco':
+                n = struct.unpack(">I", bytes(buf[p+12:p+16]))[0]
+                for i in range(n):
+                    off = p + 16 + i * 4
+                    val = struct.unpack(">I", bytes(buf[off:off+4]))[0]
+                    buf[off:off+4] = struct.pack(">I", val - moov_size)
+            elif btype == b'co64':
+                n = struct.unpack(">I", bytes(buf[p+12:p+16]))[0]
+                for i in range(n):
+                    off = p + 16 + i * 8
+                    val = struct.unpack(">Q", bytes(buf[off:off+8]))[0]
+                    buf[off:off+8] = struct.pack(">Q", val - moov_size)
+            elif btype in CONTAINERS:
+                voff = 4 if btype == b'meta' else 0
+                fix_boxes(buf, p + hdr + voff, p + size)
+            p += size
+
+    fix_boxes(new_data, new_moov_off + 8, new_moov_off + moov_size)
     return bytes(new_data)
 
 
@@ -389,6 +418,10 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     data = remuxed.read_bytes()
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
+
+    layout = _detect_layout(data)
+    if log_func:
+        log_func(f"[INFO] Detected layout: {layout}")
 
     # ---- 3. Insert free atom after ftyp ----
     if log_func:
@@ -417,8 +450,17 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
         log_func(f"── 5/7  Frame inflation (10x, stts overflow) ──────────────────")
     md_tree = build_metadata_tree("akila", "akila", comment)
     md_growth = len(md_tree)
-    pre_shift = 8 + md_growth
-    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True, moov_before_mdat=True)
+
+    if layout == 'faststart':
+        pre_shift = 8 + md_growth
+        moov_before = True
+        need_relocate = True
+    else:
+        pre_shift = 8
+        moov_before = False
+        need_relocate = False
+
+    patched = inject_fake_frames(data, pre_shift=pre_shift, stts_overflow=True, moov_before_mdat=moov_before)
     if patched is None:
         if log_func:
             log_func("[ERROR] Frame injection failed (moov/trak/stsz not found)")
@@ -448,8 +490,13 @@ def patch_all(input_path, output_path, comment="@akila", log_func=None):
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
-    # ---- Relocate moov to end (Non-Faststart) ----
-    data = _move_moov_to_end(bytes(data))
+    # ---- Relocate moov if needed ----
+    if need_relocate:
+        if log_func:
+            log_func("[RELOCATE] moving moov to end for Non-Faststart output")
+        data = _move_moov_to_end(bytes(data))
+        if log_func:
+            log_func("[RELOCATE] done")
 
     # ---- Write output ----
     output_path.write_bytes(data)
