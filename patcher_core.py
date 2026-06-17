@@ -308,20 +308,19 @@ def remux(input_path, output_path, comment, log_func=None):
     return True
 
 
-def stbl_list(atoms, result, path=""):
+def stbl_list(atoms, result):
     for atom in atoms:
-        cur = f"{path}/{atom['name'].decode('latin1')}"
         if atom['name'] in (b'stco', b'co64'):
             d = atom['data']
             entry_size = 8 if atom['name'] == b'co64' else 4
             n = int.from_bytes(d[4:8], 'big')
-            off = atom['start'] + 8 + 8  # atom header (8) + version/flags (4) + count (4)
+            data_start_off = atom['start'] + 16
             vals = []
             for i in range(n):
                 vals.append(d[8+i*entry_size:8+i*entry_size+entry_size])
-            result.append((cur, off - atom['start'], vals))
+            result.append((data_start_off, vals, entry_size))
         if 'children' in atom:
-            stbl_list(atom['children'], result, cur)
+            stbl_list(atom['children'], result)
 
 
 def _move_moov_to_end(data):
@@ -332,10 +331,8 @@ def _move_moov_to_end(data):
         box_type = data[pos+4:pos+8]
         header_size = 8
         if box_size == 0:
-            # extends to end of file, must be last box
             box_size = len(data) - pos
         elif box_size == 1:
-            # 64-bit extended size
             if pos + 16 > len(data):
                 break
             box_size = struct.unpack(">Q", data[pos+8:pos+16])[0]
@@ -351,31 +348,25 @@ def _move_moov_to_end(data):
     if moov_start < 0 or moov_size < 0:
         return data
 
-    # Move moov to end
     moov_end = moov_start + moov_size
     before = data[:moov_start]
     after = data[moov_end:]
-    new_moov_start = len(before) + len(after)
     new_data = bytearray(before + after + data[moov_start:moov_end])
+    new_moov_off = len(before) + len(after)
 
-    # Adjust stco/co64 offsets inside the relocated moov
-    from binascii import hexlify
-    tree, _ = read_atoms_in_range(new_data, new_moov_start + 8, new_moov_start + moov_size)
-    stco_name_order = []
-    stbl_list(tree, stco_name_order)
-    for path, coff_off, integer_offsets in stco_name_order:
-        stco_start = new_moov_start + 8 + coff_off
-        for i in range(len(integer_offsets)):
-            off_bytes = integer_offsets[i]
-            old_val = 0
-            if len(off_bytes) == 4:
-                old_val = struct.unpack(">I", off_bytes)[0]
+    tree, _ = read_atoms_in_range(new_data, new_moov_off + 8, new_moov_off + moov_size)
+    stco_info = []
+    stbl_list(tree, stco_info)
+    for off, vals, esize in stco_info:
+        for i, bval in enumerate(vals):
+            if esize == 4:
+                old_val = struct.unpack(">I", bval)[0]
                 new_val = old_val - moov_size
-                new_data[stco_start + i*4:stco_start + i*4+4] = struct.pack(">I", new_val)
+                new_data[off + i*4:off + i*4+4] = struct.pack(">I", new_val)
             else:
-                old_val = struct.unpack(">Q", off_bytes)[0]
+                old_val = struct.unpack(">Q", bval)[0]
                 new_val = old_val - moov_size
-                new_data[stco_start + i*8:stco_start + i*8+8] = struct.pack(">Q", new_val)
+                new_data[off + i*8:off + i*8+8] = struct.pack(">Q", new_val)
     return bytes(new_data)
 
 
