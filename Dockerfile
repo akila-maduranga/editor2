@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y ffmpeg ca-certificates curl && \
 RUN . /etc/os-release && \
     echo "Types: deb" > /etc/apt/sources.list.d/gpac.sources && \
     echo "URIs: https://dist.gpac.io/gpac/linux/ubuntu" >> /etc/apt/sources.list.d/gpac.sources && \
-    echo "Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}" >> /etc/apt/sources.list.d/gpac.sources && \
+    echo "Suites: bookworm" >> /etc/apt/sources.list.d/gpac.sources && \
     echo "Components: nightly" >> /etc/apt/sources.list.d/gpac.sources && \
     echo "Signed-By: /etc/apt/keyrings/gpac.asc" >> /etc/apt/sources.list.d/gpac.sources
 
