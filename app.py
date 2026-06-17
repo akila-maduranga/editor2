@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 TikTok MP4 Patcher — Self-hosted VPS tool
-Implements 10 structural patches:
+Implements 12 structural patches:
 
   1. Brand spoofing     — ftyp: major=isom, minor=0x200, compat=[isom,iso2,avc1,mp41]
   2. Date zeroing       — mvhd/tkhd/mdhd creation_time + modification_time → 0
   3. Language spoofing  — mdhd language field → 'und' (0x55C4)
-  4. stts rewrite        — collapse to 1 entry, count from stsz, delta=1
+  4. Frame count infl.  — stts: 1 entry, count=19690, delta=1
   5. Fake trailer atom  — append invalid-size box after mdat
   6. Encoder spoofing   — ffmpeg sets Lavf60.16.100 during remux
   7. Comment injection  — ffmpeg -metadata comment injected during remux
   8. Timescale fix      — mdhd timescale → 120 (120 fps)
-  9. B-frame limiter    — ctts: cap non-zero offset entries at 2
- 10. Bitrate spoof      — inject btrt box in stsd→avc1 with 18 Mbps
- 11. stsz count         — skipped (keeps frame mapping intact for playback)
+  9. stsz inflate       — N*10 entries, extras=0 (safe zero-byte reads)
+ 10. stsc extend        — extend to match N*10 frames
+ 11. Bitrate spoof      — inject btrt box in stsd→avc1 with 18 Mbps
+ 12. ctts B-frame limit — skipped (zeroing corrupts display order)
 """
 
 import os, uuid, subprocess, threading, queue, struct, shutil
@@ -227,21 +228,20 @@ def patch_frame_count(data: bytes, log: queue.Queue) -> bytes:
         if minf_off == -1: continue
         stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
         if stbl_off == -1: continue
+        stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
+        if stsz_off == -1: continue
+        real = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        target = real * 10
+
         stts_off, stts_sz = find_box(data, b"stts", stbl_off+8, stbl_off+stbl_sz)
         if stts_off == -1: continue
 
-        # Read real frame count from stsz (keeps stts/stsz consistent)
-        stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
-        if stsz_off == -1: continue
-        body_off  = stts_off + 8
-        real = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
-        _log(log, f"[PATCH] stts  frames={real}  delta=1  (120 fps)")
+        _log(log, f"[PATCH] stts  frames={target}  delta=1  (120 fps)")
 
-        # Build new stts: 1 entry, delta=1 (120fps with mdhd timescale=120)
         new_body = (
             b"\x00\x00\x00\x00"
             + struct.pack(">I", 1)           # entry_count = 1
-            + struct.pack(">I", real)         # sample_count from stsz
+            + struct.pack(">I", target)       # sample_count
             + struct.pack(">I", 1)            # sample_delta = 1
         )
         new_stts = struct.pack(">I", 8+len(new_body)) + b"stts" + new_body
@@ -298,7 +298,8 @@ def patch_mdhd_timescale(data: bytes, log: queue.Queue) -> bytes:
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch 9 — stsz sample count → 19690
+# Patch 9 — stsz sample count → N*10 (extra entries = 0)
+# Extra frames have size=0 so the player reads zero bytes from mdat.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
@@ -315,13 +316,115 @@ def patch_stsz_count(data: bytes, log: queue.Queue) -> bytes:
         if stbl_off == -1: continue
         stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
         if stsz_off == -1: continue
-        old_count = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
-        _log(log, f"[SKIP]  stsz count {old_count} — inflated via stts; real entries kept for playback")
-        return data
+        sample_size = struct.unpack(">I", data[stsz_off+12:stsz_off+16])[0]
+        old_count   = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        target = old_count * 10
+        if target <= old_count:
+            _log(log, f"[SKIP]  stsz count {old_count}, target {target}")
+            return data
+        if sample_size != 0:
+            entries = b"".join(struct.pack(">I", sample_size) for _ in range(old_count))
+            sample_size_val = 0
+        else:
+            existing = [struct.unpack(">I", data[stsz_off+20+i*4:stsz_off+24+i*4])[0] for i in range(old_count)]
+            entries = b"".join(struct.pack(">I", sz) for sz in existing)
+            sample_size_val = 0
+        entries += b"\x00" * 4 * (target - old_count)
+        new_body = b"\x00\x00\x00\x00" + struct.pack(">II", sample_size_val, target) + entries
+        new_stsz = struct.pack(">I", 8 + len(new_body)) + b"stsz" + new_body
+        delta = len(new_stsz) - stsz_sz
+        p = bytearray(data)
+        p[stsz_off:stsz_off+stsz_sz] = new_stsz
+        for poff in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+            old = struct.unpack(">I", p[poff:poff+4])[0]
+            struct.pack_into(">I", p, poff, old + delta)
+        result = _adjust_chunk_offsets(bytes(p), delta)
+        _log(log, f"[PATCH] stsz  count {old_count} → {target}  (delta={delta})")
+        return result
     return data
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch 10 — ctts B-frame limiter → 2
+# Patch 10 — stsc extend to cover N*10 frames
+# Extra frames (size=0 from stsz) are mapped into the last existing chunk.
+# If the last pattern already covers only 1 chunk, modify spc in-place.
+# Otherwise insert a new entry for the final chunk.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_stsc_extend(data: bytes, log: queue.Queue) -> bytes:
+    moov_off, moov_sz = find_box(data, b"moov")
+    if moov_off == -1: return data
+    for trak_off, trak_sz, tt in list(iter_boxes(data, moov_off+8, moov_off+moov_sz)):
+        if tt != b"trak": continue
+        if not _is_video_trak(data, trak_off, trak_sz): continue
+        mdia_off, mdia_sz = find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1: continue
+        minf_off, minf_sz = find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1: continue
+        stbl_off, stbl_sz = find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1: continue
+        stsz_off, stsz_sz = find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
+        if stsz_off == -1: continue
+        stsc_off, stsc_sz = find_box(data, b"stsc", stbl_off+8, stbl_off+stbl_sz)
+        if stsc_off == -1: continue
+        stco_off, stco_sz = find_box(data, b"stco", stbl_off+8, stbl_off+stbl_sz)
+        if stco_off == -1: continue
+
+        inflated = struct.unpack(">I", data[stsz_off+16:stsz_off+20])[0]
+        stco_count = struct.unpack(">I", data[stco_off+12:stco_off+16])[0]
+
+        # Parse stsc entries
+        b_off = stsc_off + 12
+        entry_count = struct.unpack(">I", data[b_off:b_off+4])[0]
+        if entry_count == 0: continue
+
+        entries = []
+        for i in range(entry_count):
+            off = b_off + 4 + i * 12
+            fc = struct.unpack(">I", data[off:off+4])[0]
+            spc = struct.unpack(">I", data[off+4:off+8])[0]
+            di = struct.unpack(">I", data[off+8:off+12])[0]
+            entries.append((fc, spc, di))
+
+        total = 0
+        for i in range(entry_count - 1):
+            total += (entries[i+1][0] - entries[i][0]) * entries[i][1]
+
+        last_fc, last_spc, last_di = entries[-1]
+        chunks_in_last = stco_count - last_fc + 1
+        total += chunks_in_last * last_spc
+
+        if total >= inflated:
+            _log(log, f"[SKIP]  stsc  total {total} >= {inflated}")
+            return data
+
+        extra = inflated - total
+
+        if chunks_in_last == 1:
+            last_entry_off = b_off + 4 + (entry_count - 1) * 12
+            p = bytearray(data)
+            struct.pack_into(">I", p, last_entry_off + 4, last_spc + extra)
+            _log(log, f"[PATCH] stsc  spc {last_spc} → {last_spc + extra}")
+            return bytes(p)
+
+        # Insert new entry for the final chunk
+        new_entry = struct.pack(">III", stco_count, last_spc + extra, last_di)
+        old_body = data[stsc_off+12:stsc_off+stsc_sz]
+        new_body = data[stsc_off+12:stsc_off+16] + struct.pack(">I", entry_count + 1) + data[stsc_off+16:stsc_off+16+entry_count*12] + new_entry
+        new_stsc = struct.pack(">I", 8 + len(new_body)) + b"stsc" + new_body
+        delta = len(new_stsc) - stsc_sz
+
+        p = bytearray(data)
+        p[stsc_off:stsc_off+stsc_sz] = new_stsc
+        for poff in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+            old = struct.unpack(">I", p[poff:poff+4])[0]
+            struct.pack_into(">I", p, poff, old + delta)
+        result = _adjust_chunk_offsets(bytes(p), delta)
+        _log(log, f"[PATCH] stsc  entries {entry_count}→{entry_count+1}, final chunk spc {last_spc}→{last_spc+extra}")
+        return result
+    return data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch 11 — ctts B-frame limiter → 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def patch_ctts_bframes(data: bytes, log: queue.Queue) -> bytes:
@@ -459,23 +562,26 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         _log(log, ""); _log(log, "── 7/11 mdhd timescale → 120 (120 fps) ─────────────────────")
         raw = patch_mdhd_timescale(raw, log)
 
-        _log(log, ""); _log(log, "── 8/11 stsz sample count (skipped — keeps frame mapping) ───")
+        _log(log, ""); _log(log, "── 8/12 stsz sample count → 19690 (zero for extras) ──────────")
         raw = patch_stsz_count(raw, log)
 
-        _log(log, ""); _log(log, "── 9/11 ctts B-frame limiter (skipped — corrupts display) ──")
+        _log(log, ""); _log(log, "── 9/12 stsc extend last entry ────────────────────────────────")
+        raw = patch_stsc_extend(raw, log)
+
+        _log(log, ""); _log(log, "── 10/12 ctts B-frame limiter (skipped — corrupts display) ───")
         raw = patch_ctts_bframes(raw, log)
 
-        _log(log, ""); _log(log, "── 10/11 btrt bitrate box → 18 Mbps ─────────────────────────")
+        _log(log, ""); _log(log, "── 11/12 btrt bitrate box → 18 Mbps ──────────────────────────")
         raw = patch_bitrate(raw, log)
 
-        _log(log, ""); _log(log, "── 11/11 Fake trailer atom ───────────────────────────────────")
+        _log(log, ""); _log(log, "── 12/12 Fake trailer atom ────────────────────────────────────")
         raw = patch_fake_trailer(raw, log)
 
         out_path.write_bytes(raw)
         _log(log, f"\n[WRITE] {out_path.name}  ({out_path.stat().st_size:,} bytes)")
         _job_output[job_id] = f"{job_id}_{out_name}"
         _job_status[job_id] = "done"
-        _log(log, ""); _log(log, "── ALL 11 PATCHES APPLIED ✓ ─────────────────────────────────")
+        _log(log, ""); _log(log, "── ALL 12 PATCHES APPLIED ✓ ─────────────────────────────────")
         _log(log, f"[DONE]  {out_name}")
 
     except Exception as exc:
